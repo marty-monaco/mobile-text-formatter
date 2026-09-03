@@ -2,3 +2,9 @@ streamlit
 requests
 trafilatura
 pypdf
+python-docx
+ebooklib
+beautifulsoup4
+striprtf
+markdown
+extruct
