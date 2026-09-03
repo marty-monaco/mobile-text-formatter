@@ -1,6 +1,5 @@
 import html
 import io
-import json
 import re
 import ebooklib
 import extruct
@@ -14,11 +13,16 @@ from ebooklib import epub
 from pypdf import PdfReader
 from striprtf.striprtf import rtf_to_text
 
-st.set_page_config(page_title="Mobile Reader", page_icon="📖", layout="centered")
+st.set_page_config(page_title="Clean Reader", page_icon="📖", layout="centered")
 
-# CSS Scaffolding for mobile layout
+# Mobile Scaffolding, PWA/Web-App Metas, and Progress Bar Injection
 st.markdown(
     """
+    <!-- Mobile PWA Meta Tags -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
     <style>
     .block-container {
         padding-top: 1rem;
@@ -27,6 +31,24 @@ st.markdown(
         padding-right: 0.85rem;
         max-width: 620px;
     }
+    
+    /* Pinned Progress Bar at top edge */
+    #progress-container {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 4px;
+        background-color: transparent;
+        z-index: 99999;
+    }
+    #progress-bar {
+        width: 0%;
+        height: 100%;
+        background-color: #ff4b4b;
+        transition: width 0.1s ease-out;
+    }
+
     .reader-frame {
         padding: 1.25rem 1rem;
         border-radius: 8px;
@@ -36,20 +58,30 @@ st.markdown(
         margin-bottom: 1.35em;
         line-height: 1.8;
     }
-    .recipe-meta {
-        background: rgba(125, 125, 125, 0.1);
-        padding: 10px;
-        border-radius: 6px;
-        margin-bottom: 1rem;
-    }
     </style>
+
+    <div id="progress-container">
+        <div id="progress-bar"></div>
+    </div>
+
+    <script>
+    // Update scroll progress bar on parent window
+    window.addEventListener('scroll', () => {
+        const doc = document.documentElement;
+        const totalHeight = doc.scrollHeight - doc.clientHeight;
+        if (totalHeight > 0) {
+            const progress = (window.scrollY / totalHeight) * 100;
+            const bar = document.getElementById('progress-bar');
+            if (bar) bar.style.width = progress + '%';
+        }
+    });
+    </script>
     """,
     unsafe_allow_html=True,
 )
 
 
 def decode_bytes(data: bytes) -> str:
-    """Attempts common encodings used in legacy and archive text files."""
     for enc in ("utf-8", "latin-1", "iso-8859-1", "cp1252"):
         try:
             return data.decode(enc)
@@ -59,7 +91,6 @@ def decode_bytes(data: bytes) -> str:
 
 
 def format_plain_text(raw_text: str) -> str:
-    """Reflows hard-wrapped lines into unified mobile paragraphs."""
     text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
     blocks = re.split(r"\n\s*\n+", text)
     clean_paragraphs = []
@@ -80,7 +111,6 @@ def format_plain_text(raw_text: str) -> str:
     return "".join(clean_paragraphs)
 
 
-# Extractors by Format
 def extract_pdf(file_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(file_bytes))
     return format_plain_text("\n\n".join(p.extract_text() or "" for p in reader.pages))
@@ -108,12 +138,10 @@ def extract_epub(file_bytes: bytes) -> str:
 
 
 def extract_markdown(file_bytes: bytes) -> str:
-    raw_md = decode_bytes(file_bytes)
-    return markdown.markdown(raw_md)
+    return markdown.markdown(decode_bytes(file_bytes))
 
 
 def extract_recipe_schema(html_content: str):
-    """Bypasses life-story blogs and ads by reading JSON-LD recipe markup."""
     try:
         data = extruct.extract(html_content, syntaxes=["json-ld"])
         for node in data.get("json-ld", []):
@@ -132,7 +160,6 @@ def format_recipe_output(recipe: dict) -> str:
     description = recipe.get("description", "")
     ingredients = recipe.get("recipeIngredient", [])
 
-    # Normalize instruction lists
     raw_steps = recipe.get("recipeInstructions", [])
     steps = []
     for step in raw_steps:
@@ -182,12 +209,10 @@ def extract_from_url(url: str) -> str:
     if url_l.endswith(".rtf"):
         return extract_rtf(resp.content)
 
-    # 1. Try Recipe Schema Parsing first (cleanest ad/fluff bypass)
     recipe_data = extract_recipe_schema(resp.text)
     if recipe_data:
         return format_recipe_output(recipe_data)
 
-    # 2. Fall back to standard ad-free web page extraction
     body = trafilatura.extract(resp.text, include_comments=False)
     if not body:
         body = trafilatura.extract(resp.text, favor_recall=True)
@@ -201,7 +226,7 @@ def extract_from_url(url: str) -> str:
 # User Interface
 st.title("📖 Clean 9:16 Reader")
 
-url_input = st.text_input("Paste URL (Article, Recipe, PDF, or raw text):", placeholder="https://...")
+url_input = st.text_input("Paste URL (Article, Recipe, PDF, or text):", placeholder="https://...")
 uploaded_file = st.file_uploader(
     "Or upload document:",
     type=["txt", "pdf", "docx", "epub", "rtf", "md"],
@@ -235,19 +260,51 @@ elif uploaded_file:
         except Exception as e:
             st.error(f"Error parsing file: {e}")
 
-# Display Controls & Reader
+# Presentation Controls & Reader Display
 if content:
     st.divider()
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        font_family_opt = st.selectbox("Typeface", ["Sans-Serif", "Serif", "Monospace"])
-    with c2:
-        font_size_val = st.slider("Font Size", min_value=14, max_value=28, value=18, step=1)
-    with c3:
-        theme = st.selectbox("Background", ["Light", "Sepia", "Dark"])
+    with st.expander("⚙️ Reader Controls & Auto-Scroll", expanded=False):
+        font_family_opt = st.selectbox(
+            "Typeface",
+            ["Sans-Serif", "Serif", "Monospace"],
+            key="reader_font"
+        )
+        font_size_val = st.slider(
+            "Font Size (px)",
+            min_value=14,
+            max_value=32,
+            value=18,
+            step=1,
+            key="reader_size"
+        )
+        theme = st.selectbox(
+            "Color Theme",
+            ["Light", "Sepia", "Dark"],
+            key="reader_theme"
+        )
 
-    # Map settings to inline styles
+        st.markdown("**Hands-Free Auto-Scroll**")
+        scroll_speed = st.select_slider(
+            "Scroll Speed",
+            options=["Off", "Slow", "Medium", "Fast"],
+            value="Off",
+            key="auto_scroll_speed"
+        )
+
+    # Convert auto-scroll speed to JavaScript interval/pixel steps
+    speed_ms = {"Off": 0, "Slow": 70, "Medium": 40, "Fast": 20}[scroll_speed]
+    auto_scroll_script = ""
+    if speed_ms > 0:
+        auto_scroll_script = f"""
+        <script>
+        if (window.autoScrollTimer) clearInterval(window.autoScrollTimer);
+        window.autoScrollTimer = setInterval(() => {{
+            window.scrollBy({{ top: 1, behavior: 'smooth' }});
+        }}, {speed_ms});
+        </script>
+        """
+
     font_map = {
         "Sans-Serif": "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
         "Serif": "Georgia, Cambria, 'Times New Roman', serif",
@@ -261,6 +318,7 @@ if content:
 
     st.markdown(
         f"""
+        {auto_scroll_script}
         <div class="reader-frame" style="
             font-family: {font_map[font_family_opt]};
             font-size: {font_size_val}px;
