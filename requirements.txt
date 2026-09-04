@@ -1,5 +1,5 @@
 streamlit
-requests
+curl_cffi
 trafilatura
 pypdf
 python-docx
@@ -8,4 +8,3 @@ beautifulsoup4
 striprtf
 markdown
 extruct
-curl_cffi
