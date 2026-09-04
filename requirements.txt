@@ -8,3 +8,4 @@ beautifulsoup4
 striprtf
 markdown
 extruct
+curl_cffi
