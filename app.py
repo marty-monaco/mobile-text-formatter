@@ -1,14 +1,15 @@
 import html
 import io
-import json
 import re
+from urllib.parse import urlsplit, urlunsplit
+
 import ebooklib
 import extruct
 import markdown
-import requests
 import streamlit as st
 import trafilatura
 from bs4 import BeautifulSoup
+from curl_cffi import requests
 from docx import Document
 from ebooklib import epub
 from pypdf import PdfReader
@@ -16,10 +17,9 @@ from striprtf.striprtf import rtf_to_text
 
 st.set_page_config(page_title="Clean Reader", page_icon="📖", layout="centered")
 
-# Mobile Scaffolding, PWA/Web-App Metas, and Progress Bar Injection
+# Mobile Scaffolding, PWA Metas, and Progress Bar
 st.markdown(
     """
-    <!-- Mobile PWA Meta Tags -->
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -33,7 +33,6 @@ st.markdown(
         max-width: 620px;
     }
     
-    /* Pinned Progress Bar at top edge */
     #progress-container {
         position: fixed;
         top: 0;
@@ -66,7 +65,6 @@ st.markdown(
     </div>
 
     <script>
-    // Update scroll progress bar on parent window
     window.addEventListener('scroll', () => {
         const doc = document.documentElement;
         const totalHeight = doc.scrollHeight - doc.clientHeight;
@@ -189,38 +187,31 @@ def format_recipe_output(recipe: dict) -> str:
 
 
 def extract_from_url(raw_input: str) -> str:
-    # 1. Regex to isolate the URL even if user shares text/title alongside it
     match = re.search(r"(https?://[^\s]+)", raw_input.strip())
     if not match:
         return "<p>Please enter a valid URL starting with http:// or https://</p>"
 
-    clean_url = match.group(1)
+    raw_url = match.group(1)
 
-    # 2. Comprehensive browser headers to prevent 403 Forbidden blocks
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    }
+    # Strip marketing & analytics query strings
+    parts = urlsplit(raw_url)
+    clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
+    # Use curl_cffi to impersonate Chrome's exact TLS/JA3 footprint
     resp = requests.get(
         clean_url,
-        headers=headers,
+        impersonate="chrome124",
         timeout=15,
         verify=False,
         allow_redirects=True,
     )
-    resp.encoding = resp.apparent_encoding
 
-    ctype = resp.headers.get("Content-Type", "").lower()
+    content_type = resp.headers.get("content-type", "").lower()
     final_url = resp.url.lower()
 
-    if "application/pdf" in ctype or final_url.endswith(".pdf"):
+    if "application/pdf" in content_type or final_url.endswith(".pdf"):
         return extract_pdf(resp.content)
-    if "text/plain" in ctype or final_url.endswith(".txt"):
+    if "text/plain" in content_type or final_url.endswith(".txt"):
         return format_plain_text(resp.text)
     if final_url.endswith(".docx"):
         return extract_docx(resp.content)
@@ -229,12 +220,10 @@ def extract_from_url(raw_input: str) -> str:
     if final_url.endswith(".rtf"):
         return extract_rtf(resp.content)
 
-    # Check for recipe schema first
     recipe_data = extract_recipe_schema(resp.text)
     if recipe_data:
         return format_recipe_output(recipe_data)
 
-    # Standard article reader extraction
     body = trafilatura.extract(resp.text, include_comments=False)
     if not body:
         body = trafilatura.extract(resp.text, favor_recall=True)
@@ -245,7 +234,7 @@ def extract_from_url(raw_input: str) -> str:
     return "<p>Unable to extract readable content.</p>"
 
 
-# User Interface
+# UI Layout
 st.title("📖 Clean 9:16 Reader")
 
 url_input = st.text_input("Paste URL (Article, Recipe, PDF, or text):", placeholder="https://...")
@@ -314,7 +303,6 @@ if content:
             key="auto_scroll_speed",
         )
 
-    # Convert auto-scroll speed to JavaScript interval/pixel steps
     speed_ms = {"Off": 0, "Slow": 70, "Medium": 40, "Fast": 20}[scroll_speed]
     auto_scroll_script = ""
     if speed_ms > 0:
