@@ -1,5 +1,6 @@
 import html
 import io
+import json
 import re
 import ebooklib
 import extruct
@@ -187,33 +188,53 @@ def format_recipe_output(recipe: dict) -> str:
     return "".join(out)
 
 
-def extract_from_url(url: str) -> str:
-    headers = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-}
-resp = requests.get(clean_url, headers=headers, timeout=15)
+def extract_from_url(raw_input: str) -> str:
+    # 1. Regex to isolate the URL even if user shares text/title alongside it
+    match = re.search(r"(https?://[^\s]+)", raw_input.strip())
+    if not match:
+        return "<p>Please enter a valid URL starting with http:// or https://</p>"
 
-    if "application/pdf" in ctype or url_l.endswith(".pdf"):
+    clean_url = match.group(1)
+
+    # 2. Comprehensive browser headers to prevent 403 Forbidden blocks
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    resp = requests.get(
+        clean_url,
+        headers=headers,
+        timeout=15,
+        verify=False,
+        allow_redirects=True,
+    )
+    resp.encoding = resp.apparent_encoding
+
+    ctype = resp.headers.get("Content-Type", "").lower()
+    final_url = resp.url.lower()
+
+    if "application/pdf" in ctype or final_url.endswith(".pdf"):
         return extract_pdf(resp.content)
-    if "text/plain" in ctype or url_l.endswith(".txt"):
+    if "text/plain" in ctype or final_url.endswith(".txt"):
         return format_plain_text(resp.text)
-    if url_l.endswith(".docx"):
+    if final_url.endswith(".docx"):
         return extract_docx(resp.content)
-    if url_l.endswith(".epub"):
+    if final_url.endswith(".epub"):
         return extract_epub(resp.content)
-    if url_l.endswith(".rtf"):
+    if final_url.endswith(".rtf"):
         return extract_rtf(resp.content)
 
+    # Check for recipe schema first
     recipe_data = extract_recipe_schema(resp.text)
     if recipe_data:
         return format_recipe_output(recipe_data)
 
+    # Standard article reader extraction
     body = trafilatura.extract(resp.text, include_comments=False)
     if not body:
         body = trafilatura.extract(resp.text, favor_recall=True)
@@ -236,7 +257,7 @@ uploaded_file = st.file_uploader(
 content = ""
 
 if url_input:
-    with st.spinner("Extracting & removing ads..."):
+    with st.spinner("Extracting & formatting..."):
         try:
             content = extract_from_url(url_input)
         except Exception as e:
@@ -269,7 +290,7 @@ if content:
         font_family_opt = st.selectbox(
             "Typeface",
             ["Sans-Serif", "Serif", "Monospace"],
-            key="reader_font"
+            key="reader_font",
         )
         font_size_val = st.slider(
             "Font Size (px)",
@@ -277,12 +298,12 @@ if content:
             max_value=32,
             value=18,
             step=1,
-            key="reader_size"
+            key="reader_size",
         )
         theme = st.selectbox(
             "Color Theme",
             ["Light", "Sepia", "Dark"],
-            key="reader_theme"
+            key="reader_theme",
         )
 
         st.markdown("**Hands-Free Auto-Scroll**")
@@ -290,7 +311,7 @@ if content:
             "Scroll Speed",
             options=["Off", "Slow", "Medium", "Fast"],
             value="Off",
-            key="auto_scroll_speed"
+            key="auto_scroll_speed",
         )
 
     # Convert auto-scroll speed to JavaScript interval/pixel steps
