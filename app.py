@@ -188,15 +188,16 @@ def format_recipe_output(recipe: dict) -> str:
 
 
 def extract_from_url(url: str) -> str:
-    resp = requests.get(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)"},
-        timeout=15,
-        verify=False,
-    )
-    resp.encoding = resp.apparent_encoding
-    ctype = resp.headers.get("Content-Type", "").lower()
-    url_l = url.lower()
+    headers = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+resp = requests.get(clean_url, headers=headers, timeout=15)
 
     if "application/pdf" in ctype or url_l.endswith(".pdf"):
         return extract_pdf(resp.content)
