@@ -20,6 +20,7 @@ st.set_page_config(page_title="Clean Reader", page_icon="📖", layout="centered
 # Mobile Scaffolding, PWA Metas, and Progress Bar
 st.markdown(
     """
+    <!-- Mobile PWA Meta Tags -->
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -33,6 +34,7 @@ st.markdown(
         max-width: 620px;
     }
     
+    /* Pinned Progress Bar at top edge */
     #progress-container {
         position: fixed;
         top: 0;
@@ -81,6 +83,7 @@ st.markdown(
 
 
 def decode_bytes(data: bytes) -> str:
+    """Attempts common encodings used in legacy and archive text files."""
     for enc in ("utf-8", "latin-1", "iso-8859-1", "cp1252"):
         try:
             return data.decode(enc)
@@ -90,6 +93,7 @@ def decode_bytes(data: bytes) -> str:
 
 
 def format_plain_text(raw_text: str) -> str:
+    """Reflows hard-wrapped lines into unified mobile paragraphs."""
     text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
     blocks = re.split(r"\n\s*\n+", text)
     clean_paragraphs = []
@@ -141,6 +145,7 @@ def extract_markdown(file_bytes: bytes) -> str:
 
 
 def extract_recipe_schema(html_content: str):
+    """Bypasses narrative content by reading JSON-LD schema markup."""
     try:
         data = extruct.extract(html_content, syntaxes=["json-ld"])
         for node in data.get("json-ld", []):
@@ -186,25 +191,58 @@ def format_recipe_output(recipe: dict) -> str:
     return "".join(out)
 
 
+def fetch_jina_proxy(target_url: str) -> str:
+    """Fallback proxy using Jina Reader to bypass bot blocks and anti-scraping walls."""
+    proxy_url = f"https://r.jina.ai/{target_url}"
+    resp = requests.get(proxy_url, impersonate="chrome124", timeout=20)
+    if resp.status_code == 200 and resp.text.strip():
+        return markdown.markdown(resp.text)
+    return ""
+
+
 def extract_from_url(raw_input: str) -> str:
+    # 1. Regex to isolate URL from shared titles/text (fixes "No connection adapters" error)
     match = re.search(r"(https?://[^\s]+)", raw_input.strip())
     if not match:
         return "<p>Please enter a valid URL starting with http:// or https://</p>"
 
-    raw_url = match.group(1)
+    clean_url = match.group(1)
 
-    # Strip marketing & analytics query strings
-    parts = urlsplit(raw_url)
-    clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    # 2. Keep query parameters intact for shorteners, but strip tracking queries for direct pages
+    parts = urlsplit(clean_url)
+    if not ("share.google" in parts.netloc or "bit.ly" in parts.netloc):
+        clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
-    # Use curl_cffi to impersonate Chrome's exact TLS/JA3 footprint
-    resp = requests.get(
-        clean_url,
-        impersonate="chrome124",
-        timeout=15,
-        verify=False,
-        allow_redirects=True,
+    # 3. Request with TLS fingerprint impersonation and redirect resolution
+    try:
+        resp = requests.get(
+            clean_url,
+            impersonate="chrome124",
+            timeout=15,
+            verify=False,
+            allow_redirects=True,
+        )
+    except Exception:
+        proxy_content = fetch_jina_proxy(clean_url)
+        if proxy_content:
+            return proxy_content
+        raise
+
+    # 4. Check for anti-scraping block pages (403, 429, or known IP block phrases)
+    anti_bot_patterns = ["icanhazip.com", "contentlicensing@people.inc", "captcha-delivery.com"]
+    is_blocked = (
+        resp.status_code in (403, 429)
+        or any(pat in resp.text for pat in anti_bot_patterns)
     )
+
+    if is_blocked:
+        proxy_content = fetch_jina_proxy(clean_url)
+        if proxy_content:
+            return proxy_content
+        return (
+            "<p>This site blocked direct access. "
+            "Please paste the article/recipe text into the manual box below.</p>"
+        )
 
     content_type = resp.headers.get("content-type", "").lower()
     final_url = resp.url.lower()
@@ -220,10 +258,12 @@ def extract_from_url(raw_input: str) -> str:
     if final_url.endswith(".rtf"):
         return extract_rtf(resp.content)
 
+    # Recipe Schema Parser
     recipe_data = extract_recipe_schema(resp.text)
     if recipe_data:
         return format_recipe_output(recipe_data)
 
+    # Standard article extraction via Trafilatura
     body = trafilatura.extract(resp.text, include_comments=False)
     if not body:
         body = trafilatura.extract(resp.text, favor_recall=True)
@@ -231,21 +271,35 @@ def extract_from_url(raw_input: str) -> str:
     if body:
         return format_plain_text(body)
 
+    # Secondary fallback to Jina reader if Trafilatura extracts nothing
+    proxy_content = fetch_jina_proxy(clean_url)
+    if proxy_content:
+        return proxy_content
+
     return "<p>Unable to extract readable content.</p>"
 
 
 # UI Layout
 st.title("📖 Clean 9:16 Reader")
 
-url_input = st.text_input("Paste URL (Article, Recipe, PDF, or text):", placeholder="https://...")
+url_input = st.text_input(
+    "Paste URL (Article, Recipe, PDF, or text):",
+    placeholder="https://...",
+)
+
 uploaded_file = st.file_uploader(
     "Or upload document:",
     type=["txt", "pdf", "docx", "epub", "rtf", "md"],
 )
 
+with st.expander("📋 Manual Text / Recipe Paste (Fallback)"):
+    manual_text = st.text_area("Paste raw text or recipe directions here:", height=150)
+
 content = ""
 
-if url_input:
+if manual_text.strip():
+    content = format_plain_text(manual_text)
+elif url_input:
     with st.spinner("Extracting & formatting..."):
         try:
             content = extract_from_url(url_input)
