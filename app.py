@@ -238,7 +238,7 @@ def fetch_jina_proxy(target_url: str) -> str:
 def extract_from_url(raw_input: str) -> str:
     match = re.search(r"(https?://[^\s]+)", raw_input.strip())
     if not match:
-        return "<p>Please enter a valid URL starting with http:// or https://</p>"[cite: 1]
+        return "<p>Please enter a valid URL starting with http:// or https://</p>"
 
     clean_url = match.group(1)
 
@@ -252,7 +252,7 @@ def extract_from_url(raw_input: str) -> str:
             impersonate="chrome124",
             timeout=15,
             verify=False,
-            allow_redirects=True,[cite: 1]
+            allow_redirects=True,
         )
     except Exception:
         proxy_content = fetch_jina_proxy(clean_url)
@@ -278,33 +278,33 @@ def extract_from_url(raw_input: str) -> str:
     content_type = resp.headers.get("content-type", "").lower()
     final_url = resp.url.lower()
 
-    if "application/pdf" in content_type or final_url.endswith(".pdf"):[cite: 1]
-        return extract_pdf(resp.content)[cite: 1]
-    if "text/plain" in content_type or final_url.endswith(".txt"):[cite: 1]
-        return format_plain_text(resp.text)[cite: 1]
-    if final_url.endswith(".docx"):[cite: 1]
-        return extract_docx(resp.content)[cite: 1]
-    if final_url.endswith(".epub"):[cite: 1]
-        return extract_epub(resp.content)[cite: 1]
-    if final_url.endswith(".rtf"):[cite: 1]
-        return extract_rtf(resp.content)[cite: 1]
+    if "application/pdf" in content_type or final_url.endswith(".pdf"):
+        return extract_pdf(resp.content)
+    if "text/plain" in content_type or final_url.endswith(".txt"):
+        return format_plain_text(resp.text)
+    if final_url.endswith(".docx"):
+        return extract_docx(resp.content)
+    if final_url.endswith(".epub"):
+        return extract_epub(resp.content)
+    if final_url.endswith(".rtf"):
+        return extract_rtf(resp.content)
 
-    recipe_data = extract_recipe_schema(resp.text)[cite: 1]
-    if recipe_data:[cite: 1]
-        return format_recipe_output(recipe_data)[cite: 1]
+    recipe_data = extract_recipe_schema(resp.text)
+    if recipe_data:
+        return format_recipe_output(recipe_data)
 
-    body = trafilatura.extract(resp.text, include_comments=False)[cite: 1]
-    if not body:[cite: 1]
-        body = trafilatura.extract(resp.text, favor_recall=True)[cite: 1]
+    body = trafilatura.extract(resp.text, include_comments=False)
+    if not body:
+        body = trafilatura.extract(resp.text, favor_recall=True)
 
-    if body:[cite: 1]
-        return format_plain_text(body)[cite: 1]
+    if body:
+        return format_plain_text(body)
 
     proxy_content = fetch_jina_proxy(clean_url)
     if proxy_content:
         return proxy_content
 
-    return "<p>Unable to extract readable content.</p>"[cite: 1]
+    return "<p>Unable to extract readable content.</p>"
 
 
 # UI Layout
@@ -376,11 +376,9 @@ elif uploaded_file:
 
 # Presentation Controls & Reader Display
 if content:
-    # Save URL to persistent memory on successful extraction
     if active_source_url and not content.startswith("<p>Unable to extract") and not content.startswith("<p>Please enter"):
         save_url_to_history(active_source_url)
 
-    # Compute reading metrics
     raw_plain_text = BeautifulSoup(content, "html.parser").get_text(separator=" ")
     word_count = len(raw_plain_text.split())
     reading_time_min = max(1, round(word_count / 200)) if word_count > 0 else 0
