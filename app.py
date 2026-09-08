@@ -1,5 +1,7 @@
 import html
 import io
+import json
+import os
 import re
 from urllib.parse import urlsplit, urlunsplit
 
@@ -17,10 +19,43 @@ from striprtf.striprtf import rtf_to_text
 
 st.set_page_config(page_title="Clean Reader", page_icon="📖", layout="centered")
 
+HISTORY_FILE = "url_history.json"
+
+
+def load_history() -> list:
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+
+def save_url_to_history(url: str):
+    history = load_history()
+    if url in history:
+        history.remove(url)
+    history.insert(0, url)
+    history = history[:10]
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f)
+    except Exception:
+        pass
+
+
+def clear_history():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            os.remove(HISTORY_FILE)
+        except Exception:
+            pass
+
+
 # Mobile Scaffolding, PWA Metas, and Progress Bar
 st.markdown(
     """
-    <!-- Mobile PWA Meta Tags -->
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -34,7 +69,6 @@ st.markdown(
         max-width: 620px;
     }
     
-    /* Pinned Progress Bar at top edge */
     #progress-container {
         position: fixed;
         top: 0;
@@ -60,6 +94,11 @@ st.markdown(
         margin-bottom: 1.35em;
         line-height: 1.8;
     }
+    .meta-chip {
+        font-size: 0.82rem;
+        color: #888888;
+        margin-bottom: 0.75rem;
+    }
     </style>
 
     <div id="progress-container">
@@ -83,7 +122,6 @@ st.markdown(
 
 
 def decode_bytes(data: bytes) -> str:
-    """Attempts common encodings used in legacy and archive text files."""
     for enc in ("utf-8", "latin-1", "iso-8859-1", "cp1252"):
         try:
             return data.decode(enc)
@@ -93,7 +131,6 @@ def decode_bytes(data: bytes) -> str:
 
 
 def format_plain_text(raw_text: str) -> str:
-    """Reflows hard-wrapped lines into unified mobile paragraphs."""
     text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
     blocks = re.split(r"\n\s*\n+", text)
     clean_paragraphs = []
@@ -145,7 +182,6 @@ def extract_markdown(file_bytes: bytes) -> str:
 
 
 def extract_recipe_schema(html_content: str):
-    """Bypasses narrative content by reading JSON-LD schema markup."""
     try:
         data = extruct.extract(html_content, syntaxes=["json-ld"])
         for node in data.get("json-ld", []):
@@ -192,7 +228,6 @@ def format_recipe_output(recipe: dict) -> str:
 
 
 def fetch_jina_proxy(target_url: str) -> str:
-    """Fallback proxy using Jina Reader to bypass bot blocks and anti-scraping walls."""
     proxy_url = f"https://r.jina.ai/{target_url}"
     resp = requests.get(proxy_url, impersonate="chrome124", timeout=20)
     if resp.status_code == 200 and resp.text.strip():
@@ -201,26 +236,23 @@ def fetch_jina_proxy(target_url: str) -> str:
 
 
 def extract_from_url(raw_input: str) -> str:
-    # 1. Regex to isolate URL from shared titles/text (fixes "No connection adapters" error)
     match = re.search(r"(https?://[^\s]+)", raw_input.strip())
     if not match:
-        return "<p>Please enter a valid URL starting with http:// or https://</p>"
+        return "<p>Please enter a valid URL starting with http:// or https://</p>"[cite: 1]
 
     clean_url = match.group(1)
 
-    # 2. Keep query parameters intact for shorteners, but strip tracking queries for direct pages
     parts = urlsplit(clean_url)
     if not ("share.google" in parts.netloc or "bit.ly" in parts.netloc):
         clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
-    # 3. Request with TLS fingerprint impersonation and redirect resolution
     try:
         resp = requests.get(
             clean_url,
             impersonate="chrome124",
             timeout=15,
             verify=False,
-            allow_redirects=True,
+            allow_redirects=True,[cite: 1]
         )
     except Exception:
         proxy_content = fetch_jina_proxy(clean_url)
@@ -228,7 +260,6 @@ def extract_from_url(raw_input: str) -> str:
             return proxy_content
         raise
 
-    # 4. Check for anti-scraping block pages (403, 429, or known IP block phrases)
     anti_bot_patterns = ["icanhazip.com", "contentlicensing@people.inc", "captcha-delivery.com"]
     is_blocked = (
         resp.status_code in (403, 429)
@@ -247,43 +278,59 @@ def extract_from_url(raw_input: str) -> str:
     content_type = resp.headers.get("content-type", "").lower()
     final_url = resp.url.lower()
 
-    if "application/pdf" in content_type or final_url.endswith(".pdf"):
-        return extract_pdf(resp.content)
-    if "text/plain" in content_type or final_url.endswith(".txt"):
-        return format_plain_text(resp.text)
-    if final_url.endswith(".docx"):
-        return extract_docx(resp.content)
-    if final_url.endswith(".epub"):
-        return extract_epub(resp.content)
-    if final_url.endswith(".rtf"):
-        return extract_rtf(resp.content)
+    if "application/pdf" in content_type or final_url.endswith(".pdf"):[cite: 1]
+        return extract_pdf(resp.content)[cite: 1]
+    if "text/plain" in content_type or final_url.endswith(".txt"):[cite: 1]
+        return format_plain_text(resp.text)[cite: 1]
+    if final_url.endswith(".docx"):[cite: 1]
+        return extract_docx(resp.content)[cite: 1]
+    if final_url.endswith(".epub"):[cite: 1]
+        return extract_epub(resp.content)[cite: 1]
+    if final_url.endswith(".rtf"):[cite: 1]
+        return extract_rtf(resp.content)[cite: 1]
 
-    # Recipe Schema Parser
-    recipe_data = extract_recipe_schema(resp.text)
-    if recipe_data:
-        return format_recipe_output(recipe_data)
+    recipe_data = extract_recipe_schema(resp.text)[cite: 1]
+    if recipe_data:[cite: 1]
+        return format_recipe_output(recipe_data)[cite: 1]
 
-    # Standard article extraction via Trafilatura
-    body = trafilatura.extract(resp.text, include_comments=False)
-    if not body:
-        body = trafilatura.extract(resp.text, favor_recall=True)
+    body = trafilatura.extract(resp.text, include_comments=False)[cite: 1]
+    if not body:[cite: 1]
+        body = trafilatura.extract(resp.text, favor_recall=True)[cite: 1]
 
-    if body:
-        return format_plain_text(body)
+    if body:[cite: 1]
+        return format_plain_text(body)[cite: 1]
 
-    # Secondary fallback to Jina reader if Trafilatura extracts nothing
     proxy_content = fetch_jina_proxy(clean_url)
     if proxy_content:
         return proxy_content
 
-    return "<p>Unable to extract readable content.</p>"
+    return "<p>Unable to extract readable content.</p>"[cite: 1]
 
 
 # UI Layout
 st.title("📖 Clean 9:16 Reader")
 
+# History Dropdown
+history_list = load_history()
+selected_history_url = None
+
+if history_list:
+    with st.expander("🕒 Recent URLs (Last 10)", expanded=False):
+        chosen = st.selectbox(
+            "Select a previously accessed page:",
+            options=["-- Select from history --"] + history_list,
+            index=0,
+        )
+        if chosen != "-- Select from history --":
+            selected_history_url = chosen
+
+        if st.button("🗑️ Clear URL History"):
+            clear_history()
+            st.rerun()
+
 url_input = st.text_input(
     "Paste URL (Article, Recipe, PDF, or text):",
+    value=selected_history_url if selected_history_url else "",
     placeholder="https://...",
 )
 
@@ -296,6 +343,7 @@ with st.expander("📋 Manual Text / Recipe Paste (Fallback)"):
     manual_text = st.text_area("Paste raw text or recipe directions here:", height=150)
 
 content = ""
+active_source_url = None
 
 if manual_text.strip():
     content = format_plain_text(manual_text)
@@ -303,6 +351,7 @@ elif url_input:
     with st.spinner("Extracting & formatting..."):
         try:
             content = extract_from_url(url_input)
+            active_source_url = url_input
         except Exception as e:
             st.error(f"Failed to fetch content: {e}")
 elif uploaded_file:
@@ -327,7 +376,26 @@ elif uploaded_file:
 
 # Presentation Controls & Reader Display
 if content:
+    # Save URL to persistent memory on successful extraction
+    if active_source_url and not content.startswith("<p>Unable to extract") and not content.startswith("<p>Please enter"):
+        save_url_to_history(active_source_url)
+
+    # Compute reading metrics
+    raw_plain_text = BeautifulSoup(content, "html.parser").get_text(separator=" ")
+    word_count = len(raw_plain_text.split())
+    reading_time_min = max(1, round(word_count / 200)) if word_count > 0 else 0
+
     st.divider()
+
+    col_meta, col_copy = st.columns([3, 2])
+    with col_meta:
+        st.markdown(
+            f"<div class='meta-chip'>⏱️ ~{reading_time_min} min read &nbsp;•&nbsp; {word_count:,} words</div>",
+            unsafe_allow_html=True,
+        )
+    with col_copy:
+        with st.popover("📋 Copy Text"):
+            st.code(raw_plain_text, language=None)
 
     with st.expander("⚙️ Reader Controls & Auto-Scroll", expanded=False):
         font_family_opt = st.selectbox(
