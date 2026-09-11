@@ -242,10 +242,18 @@ def extract_from_url(raw_input: str) -> str:
 
     clean_url = match.group(1)
 
+    # 1. Preserve query parameters for shorteners and cloud drives
     parts = urlsplit(clean_url)
-    if not ("share.google" in parts.netloc or "bit.ly" in parts.netloc):
+    preserve_query_domains = ("share.google", "bit.ly", "onedrive.live.com", "1drv.ms")
+    if not any(domain in parts.netloc for domain in preserve_query_domains):
         clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
+    # 2. Force OneDrive links into direct binary download mode
+    if any(d in parts.netloc for d in ("onedrive.live.com", "1drv.ms")):
+        if "download=1" not in clean_url:
+            clean_url += ("&" if "?" in clean_url else "?") + "download=1"
+
+    # 3. Perform network request with redirection and TLS impersonation
     try:
         resp = requests.get(
             clean_url,
@@ -276,23 +284,52 @@ def extract_from_url(raw_input: str) -> str:
         )
 
     content_type = resp.headers.get("content-type", "").lower()
+    content_disp = resp.headers.get("content-disposition", "").lower()
     final_url = resp.url.lower()
 
-    if "application/pdf" in content_type or final_url.endswith(".pdf"):
+    # Match format by MIME type, Content-Disposition header, or URL extension
+    if (
+        "application/pdf" in content_type
+        or final_url.endswith(".pdf")
+        or ".pdf" in content_disp
+    ):
         return extract_pdf(resp.content)
-    if "text/plain" in content_type or final_url.endswith(".txt"):
-        return format_plain_text(resp.text)
-    if final_url.endswith(".docx"):
+
+    if (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" in content_type
+        or final_url.endswith(".docx")
+        or ".docx" in content_disp
+    ):
         return extract_docx(resp.content)
-    if final_url.endswith(".epub"):
+
+    if (
+        "application/epub+zip" in content_type
+        or final_url.endswith(".epub")
+        or ".epub" in content_disp
+    ):
         return extract_epub(resp.content)
-    if final_url.endswith(".rtf"):
+
+    if (
+        "application/rtf" in content_type
+        or "text/rtf" in content_type
+        or final_url.endswith(".rtf")
+        or ".rtf" in content_disp
+    ):
         return extract_rtf(resp.content)
 
+    if (
+        "text/plain" in content_type
+        or final_url.endswith(".txt")
+        or ".txt" in content_disp
+    ):
+        return format_plain_text(resp.text)
+
+    # Recipe Schema Parser
     recipe_data = extract_recipe_schema(resp.text)
     if recipe_data:
         return format_recipe_output(recipe_data)
 
+    # Article text extraction via Trafilatura
     body = trafilatura.extract(resp.text, include_comments=False)
     if not body:
         body = trafilatura.extract(resp.text, favor_recall=True)
@@ -329,7 +366,7 @@ if history_list:
             st.rerun()
 
 url_input = st.text_input(
-    "Paste URL (Article, Recipe, PDF, or text):",
+    "Paste URL (Article, Recipe, OneDrive, PDF, or text):",
     value=selected_history_url if selected_history_url else "",
     placeholder="https://...",
 )
@@ -376,7 +413,12 @@ elif uploaded_file:
 
 # Presentation Controls & Reader Display
 if content:
-    if active_source_url and not content.startswith("<p>Unable to extract") and not content.startswith("<p>Please enter"):
+    if (
+        active_source_url
+        and not content.startswith("<p>Unable to extract")
+        and not content.startswith("<p>Please enter")
+        and not content.startswith("<p>This site blocked")
+    ):
         save_url_to_history(active_source_url)
 
     raw_plain_text = BeautifulSoup(content, "html.parser").get_text(separator=" ")
