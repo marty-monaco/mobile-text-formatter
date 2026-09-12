@@ -14,19 +14,31 @@ Changes in this pass (see chat for full rationale):
    size, theme, scroll speed) doesn't silently re-fetch the URL.
 5. Replaced "magic string" error signaling (checking `.startswith(...)` on
    HTML content) with a small `ExtractResult` type.
-6. Fixed auto-scroll and reading-progress bar: <script> tags inside HTML
-   passed to st.markdown() never execute (browsers ignore injected
-   <script> in innerHTML). Both now run via st.components.v1.html(), which
-   renders in a real iframe where scripts do execute, and reach into
-   window.parent to scroll the actual page.
+6. Reading progress bar and auto-scroll are now rendered INSIDE a single
+   self-contained iframe (via components.html), alongside the article
+   content itself. The earlier approach reached from an iframe into
+   window.parent, which browsers block under same-origin rules once
+   Streamlit's component iframe has an opaque origin — so neither feature
+   ever actually ran. Keeping everything in one iframe avoids that
+   entirely, at the cost of the article scrolling inside a fixed-height
+   pane rather than the whole page.
+7. Added a persisted "library" (saved_articles.json) so parsed content can
+   be saved and reopened with no re-fetch, surviving source pages changing
+   or disappearing. NOTE: like the original url_history.json, this is a
+   single shared file on disk — fine for personal/local use, but would be
+   shared across visitors if this app is ever deployed for multiple users.
 
-Extra dependency introduced: bleach (pip install bleach)
+Extra dependency introduced: bleach (pip install bleach; add "bleach" to
+requirements.txt)
 """
 
 import html
 import io
+import json
 import re
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -104,7 +116,53 @@ def clear_history():
 
 
 # ---------------------------------------------------------------------------
-# Mobile scaffolding / PWA metas (no <script> here anymore — see components.html below)
+# Library (persisted parsed content — survives source pages changing/dying)
+# ---------------------------------------------------------------------------
+
+LIBRARY_FILE = Path("saved_articles.json")
+
+
+def load_library() -> dict:
+    if LIBRARY_FILE.exists():
+        try:
+            return json.loads(LIBRARY_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_to_library(key_url: str, title: str, sanitized_content: str):
+    library = load_library()
+    library[key_url] = {
+        "title": title or key_url,
+        "content": sanitized_content,
+        "saved_at": time.time(),
+    }
+    try:
+        LIBRARY_FILE.write_text(json.dumps(library), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def delete_from_library(key_url: str):
+    library = load_library()
+    library.pop(key_url, None)
+    try:
+        LIBRARY_FILE.write_text(json.dumps(library), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def guess_title(sanitized_content: str, fallback: str) -> str:
+    soup = BeautifulSoup(sanitized_content, "html.parser")
+    heading = soup.find(["h1", "h2", "h3"])
+    if heading and heading.get_text(strip=True):
+        return heading.get_text(strip=True)[:120]
+    return fallback
+
+
+# ---------------------------------------------------------------------------
+# Mobile scaffolding / PWA metas
 # ---------------------------------------------------------------------------
 st.markdown(
     """
@@ -120,78 +178,14 @@ st.markdown(
         padding-right: 0.85rem;
         max-width: 620px;
     }
-
-    #progress-container {
-        position: fixed;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 4px;
-        background-color: transparent;
-        z-index: 99999;
-    }
-    #progress-bar {
-        width: 0%;
-        height: 100%;
-        background-color: #ff4b4b;
-        transition: width 0.1s ease-out;
-    }
-
-    .reader-frame {
-        padding: 1.25rem 1rem;
-        border-radius: 8px;
-        word-break: break-word;
-    }
-    .reader-frame p {
-        margin-bottom: 1.35em;
-        line-height: 1.8;
-    }
     .meta-chip {
         font-size: 0.82rem;
         color: #888888;
         margin-bottom: 0.75rem;
     }
     </style>
-
-    <div id="progress-container">
-        <div id="progress-bar"></div>
-    </div>
     """,
     unsafe_allow_html=True,
-)
-
-# Reading-progress bar: must live in a real iframe (components.html) so the
-# <script> tag actually executes. It reaches into window.parent because the
-# progress bar / page content it measures lives in the parent document, not
-# inside this invisible iframe.
-components.html(
-    """
-    <script>
-    (function() {
-        const parentWin = window.parent;
-        const doc = parentWin.document;
-
-        function updateProgress() {
-            const el = doc.documentElement;
-            const totalHeight = el.scrollHeight - el.clientHeight;
-            const bar = doc.getElementById('progress-bar');
-            if (bar && totalHeight > 0) {
-                const progress = (parentWin.scrollY / totalHeight) * 100;
-                bar.style.width = progress + '%';
-            }
-        }
-
-        // Avoid stacking duplicate listeners across Streamlit reruns.
-        if (parentWin.__cleanReaderProgressBound) {
-            parentWin.removeEventListener('scroll', parentWin.__cleanReaderProgressHandler);
-        }
-        parentWin.__cleanReaderProgressHandler = updateProgress;
-        parentWin.__cleanReaderProgressBound = true;
-        parentWin.addEventListener('scroll', updateProgress);
-    })();
-    </script>
-    """,
-    height=0,
 )
 
 
@@ -423,6 +417,66 @@ def extract_from_url(raw_input: str) -> ExtractResult:
     return ExtractResult(ok=False, message="Unable to extract readable content from this page.")
 
 
+def render_reader(
+    html_content: str,
+    font_family: str,
+    font_size: int,
+    theme_style: str,
+    scroll_speed_ms: int,
+    pane_height: int = 600,
+):
+    """Renders the article, an in-pane progress bar, and auto-scroll all
+    inside ONE iframe. Deliberately self-contained: the script only ever
+    touches elements inside its own document, so it can't be blocked by
+    the browser's same-origin policy the way reaching into window.parent
+    can be (which is why the earlier version silently did nothing)."""
+    doc = f"""
+    <style>
+      html, body {{ margin: 0; padding: 0; height: 100%; }}
+      #progress-container {{
+          position: sticky; top: 0; left: 0; width: 100%; height: 4px;
+          background: rgba(128,128,128,0.15); z-index: 10;
+      }}
+      #progress-bar {{ width: 0%; height: 100%; background-color: #ff4b4b; transition: width 0.1s ease-out; }}
+      #reader-scroll {{ height: {pane_height}px; overflow-y: auto; -webkit-overflow-scrolling: touch; }}
+      .reader-frame {{
+          font-family: {font_family}; font-size: {font_size}px; {theme_style}
+          padding: 1.25rem 1rem;
+      }}
+      .reader-frame p {{ margin-bottom: 1.35em; line-height: 1.8; }}
+    </style>
+    <div id="reader-scroll">
+      <div id="progress-container"><div id="progress-bar"></div></div>
+      <div class="reader-frame">{html_content}</div>
+    </div>
+    <script>
+      (function() {{
+        const scrollEl = document.getElementById('reader-scroll');
+        const bar = document.getElementById('progress-bar');
+
+        function updateProgress() {{
+          const total = scrollEl.scrollHeight - scrollEl.clientHeight;
+          if (total > 0) {{ bar.style.width = (scrollEl.scrollTop / total * 100) + '%'; }}
+        }}
+        scrollEl.addEventListener('scroll', updateProgress);
+        updateProgress();
+
+        if (window.__cleanReaderScrollTimer) {{
+          clearInterval(window.__cleanReaderScrollTimer);
+          window.__cleanReaderScrollTimer = null;
+        }}
+        const speedMs = {scroll_speed_ms};
+        if (speedMs > 0) {{
+          window.__cleanReaderScrollTimer = setInterval(() => {{
+            scrollEl.scrollBy({{ top: 1, behavior: 'auto' }});
+          }}, speedMs);
+        }}
+      }})();
+    </script>
+    """
+    components.html(doc, height=pane_height + 16, scrolling=False)
+
+
 # ---------------------------------------------------------------------------
 # UI Layout
 # ---------------------------------------------------------------------------
@@ -446,6 +500,21 @@ if history_list:
             clear_history()
             st.rerun()
 
+# Saved Library (persisted parsed content — offline, no re-fetch)
+library = load_library()
+loaded_from_library = None
+
+if library:
+    with st.expander("📚 Saved Articles (offline)", expanded=False):
+        for key, entry in sorted(library.items(), key=lambda kv: kv[1]["saved_at"], reverse=True):
+            col_title, col_open, col_del = st.columns([5, 2, 1])
+            col_title.write(entry["title"])
+            if col_open.button("Open", key=f"open_{key}"):
+                loaded_from_library = entry["content"]
+            if col_del.button("🗑️", key=f"del_{key}"):
+                delete_from_library(key)
+                st.rerun()
+
 url_input = st.text_input(
     "Paste URL (Article, Recipe, OneDrive, PDF, or text):",
     value=selected_history_url if selected_history_url else "",
@@ -463,7 +532,9 @@ with st.expander("📋 Manual Text / Recipe Paste (Fallback)"):
 content = ""
 active_source_url = None
 
-if manual_text.strip():
+if loaded_from_library:
+    content = loaded_from_library
+elif manual_text.strip():
     content = format_plain_text(manual_text)
 elif url_input:
     with st.spinner("Extracting & formatting..."):
@@ -514,6 +585,13 @@ if content:
         with st.popover("📋 Copy Text"):
             st.code(raw_plain_text, language=None)
 
+    if active_source_url:
+        if st.button("💾 Save to Library (read offline later)"):
+            sanitized = sanitize_html(content)
+            title = guess_title(sanitized, fallback=active_source_url)
+            save_to_library(active_source_url, title, sanitized)
+            st.success("Saved for offline reading.")
+
     with st.expander("⚙️ Reader Controls & Auto-Scroll", expanded=False):
         font_family_opt = st.selectbox(
             "Typeface",
@@ -542,31 +620,16 @@ if content:
             key="auto_scroll_speed",
         )
 
-    speed_ms = {"Off": 0, "Slow": 70, "Medium": 40, "Fast": 20}[scroll_speed]
+        pane_height_val = st.slider(
+            "Reading Pane Height (px)",
+            min_value=400,
+            max_value=1000,
+            value=600,
+            step=50,
+            key="reader_pane_height",
+        )
 
-    # Auto-scroll must run inside a real iframe (components.html) for its
-    # <script> to execute at all, and it reaches into window.parent so it
-    # scrolls the actual page rather than the (invisible) iframe itself.
-    components.html(
-        f"""
-        <script>
-        (function() {{
-            const parentWin = window.parent;
-            if (parentWin.__cleanReaderScrollTimer) {{
-                clearInterval(parentWin.__cleanReaderScrollTimer);
-                parentWin.__cleanReaderScrollTimer = null;
-            }}
-            const speedMs = {speed_ms};
-            if (speedMs > 0) {{
-                parentWin.__cleanReaderScrollTimer = setInterval(() => {{
-                    parentWin.document.documentElement.scrollBy({{ top: 1, behavior: 'smooth' }});
-                }}, speedMs);
-            }}
-        }})();
-        </script>
-        """,
-        height=0,
-    )
+    speed_ms = {"Off": 0, "Slow": 70, "Medium": 40, "Fast": 20}[scroll_speed]
 
     font_map = {
         "Sans-Serif": "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
@@ -579,20 +642,13 @@ if content:
         "Dark": "background-color: #1a1a1a; color: #e0e0e0;",
     }
 
-    # Sanitize once more right before render — belt-and-suspenders, since
-    # this is the single place all content paths converge before hitting
-    # unsafe_allow_html=True.
     safe_content = sanitize_html(content)
 
-    st.markdown(
-        f"""
-        <div class="reader-frame" style="
-            font-family: {font_map[font_family_opt]};
-            font-size: {font_size_val}px;
-            {theme_map[theme]}
-        ">
-            {safe_content}
-        </div>
-        """,
-        unsafe_allow_html=True,
+    render_reader(
+        html_content=safe_content,
+        font_family=font_map[font_family_opt],
+        font_size=font_size_val,
+        theme_style=theme_map[theme],
+        scroll_speed_ms=speed_ms,
+        pane_height=pane_height_val,
     )
