@@ -271,4 +271,328 @@ def extract_recipe_schema(html_content: str):
     return None
 
 
-def
+def format_recipe_output(recipe: dict) -> str:
+    title = recipe.get("name", "Recipe")
+    description = recipe.get("description", "")
+    ingredients = recipe.get("recipeIngredient", [])
+
+    raw_steps = recipe.get("recipeInstructions", [])
+    steps = []
+    for step in raw_steps:
+        if isinstance(step, str):
+            steps.append(step)
+        elif isinstance(step, dict) and "text" in step:
+            steps.append(step["text"])
+
+    out = [f"<h2>{html.escape(title)}</h2>"]
+    if description:
+        out.append(f"<p><em>{html.escape(description)}</em></p>")
+
+    if ingredients:
+        out.append("<h3>Ingredients</h3><ul>")
+        for item in ingredients:
+            out.append(f"<li>{html.escape(item)}</li>")
+        out.append("</ul>")
+
+    if steps:
+        out.append("<h3>Directions</h3><ol>")
+        for step in steps:
+            out.append(f"<li>{html.escape(step)}</li>")
+        out.append("</ol>")
+
+    return "".join(out)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_jina_proxy(target_url: str) -> str:
+    proxy_url = f"https://r.jina.ai/{target_url}"
+    resp = requests.get(proxy_url, impersonate="chrome124", timeout=20)
+    if resp.status_code == 200 and resp.text.strip():
+        # Third-party proxy output is untrusted — sanitize before returning.
+        return sanitize_html(markdown.markdown(resp.text))
+    return ""
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def extract_from_url(raw_input: str) -> ExtractResult:
+    match = re.search(r"(https?://[^\s]+)", raw_input.strip())
+    if not match:
+        return ExtractResult(ok=False, message="Please enter a valid URL starting with http:// or https://")
+
+    clean_url = match.group(1)
+
+    # 1. Preserve query parameters for shorteners and cloud drives
+    parts = urlsplit(clean_url)
+    preserve_query_domains = ("share.google", "bit.ly", "onedrive.live.com", "1drv.ms")
+    if not any(domain in parts.netloc for domain in preserve_query_domains):
+        clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+    # 2. Force OneDrive links into direct binary download mode
+    if any(d in parts.netloc for d in ("onedrive.live.com", "1drv.ms")):
+        if "download=1" not in clean_url:
+            clean_url += ("&" if "?" in clean_url else "?") + "download=1"
+
+    # 3. Perform network request with redirection and real TLS verification.
+    # NOTE: we deliberately do NOT set verify=False here. A blanket bypass
+    # makes every fetch vulnerable to a man-in-the-middle silently swapping
+    # in different content. If a specific site has a known-broken cert
+    # chain, handle that as a narrow, visible exception rather than
+    # disabling verification for every request.
+    try:
+        resp = requests.get(
+            clean_url,
+            impersonate="chrome124",
+            timeout=15,
+            allow_redirects=True,
+        )
+    except SSLError:
+        return ExtractResult(
+            ok=False,
+            message=(
+                "This site's TLS certificate could not be verified, so the page "
+                "was not fetched for your safety. Try the manual paste box below instead."
+            ),
+        )
+    except Exception:
+        proxy_content = fetch_jina_proxy(clean_url)
+        if proxy_content:
+            return ExtractResult(ok=True, content=proxy_content)
+        return ExtractResult(ok=False, message="Failed to fetch this URL.")
+
+    anti_bot_patterns = ["icanhazip.com", "contentlicensing@people.inc", "captcha-delivery.com"]
+    is_blocked = (
+        resp.status_code in (403, 429)
+        or any(pat in resp.text for pat in anti_bot_patterns)
+    )
+
+    if is_blocked:
+        proxy_content = fetch_jina_proxy(clean_url)
+        if proxy_content:
+            return ExtractResult(ok=True, content=proxy_content)
+        return ExtractResult(
+            ok=False,
+            message="This site blocked direct access. Please paste the article/recipe text into the manual box below.",
+        )
+
+    content_type = resp.headers.get("content-type", "").lower()
+    content_disp = resp.headers.get("content-disposition", "").lower()
+    final_url = resp.url.lower()
+
+    # Match format by MIME type, Content-Disposition header, or URL extension
+    if "application/pdf" in content_type or final_url.endswith(".pdf") or ".pdf" in content_disp:
+        return ExtractResult(ok=True, content=extract_pdf(resp.content))
+
+    if (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" in content_type
+        or final_url.endswith(".docx")
+        or ".docx" in content_disp
+    ):
+        return ExtractResult(ok=True, content=extract_docx(resp.content))
+
+    if "application/epub+zip" in content_type or final_url.endswith(".epub") or ".epub" in content_disp:
+        return ExtractResult(ok=True, content=extract_epub(resp.content))
+
+    if (
+        "application/rtf" in content_type
+        or "text/rtf" in content_type
+        or final_url.endswith(".rtf")
+        or ".rtf" in content_disp
+    ):
+        return ExtractResult(ok=True, content=extract_rtf(resp.content))
+
+    if "text/plain" in content_type or final_url.endswith(".txt") or ".txt" in content_disp:
+        return ExtractResult(ok=True, content=format_plain_text(resp.text))
+
+    # Recipe Schema Parser
+    recipe_data = extract_recipe_schema(resp.text)
+    if recipe_data:
+        return ExtractResult(ok=True, content=format_recipe_output(recipe_data))
+
+    # Article text extraction via Trafilatura
+    body = trafilatura.extract(resp.text, include_comments=False)
+    if not body:
+        body = trafilatura.extract(resp.text, favor_recall=True)
+
+    if body:
+        return ExtractResult(ok=True, content=format_plain_text(body))
+
+    proxy_content = fetch_jina_proxy(clean_url)
+    if proxy_content:
+        return ExtractResult(ok=True, content=proxy_content)
+
+    return ExtractResult(ok=False, message="Unable to extract readable content from this page.")
+
+
+# ---------------------------------------------------------------------------
+# UI Layout
+# ---------------------------------------------------------------------------
+st.title("📖 Clean 9:16 Reader")
+
+# History Dropdown
+history_list = load_history()
+selected_history_url = None
+
+if history_list:
+    with st.expander("🕒 Recent URLs (Last 10)", expanded=False):
+        chosen = st.selectbox(
+            "Select a previously accessed page:",
+            options=["-- Select from history --"] + history_list,
+            index=0,
+        )
+        if chosen != "-- Select from history --":
+            selected_history_url = chosen
+
+        if st.button("🗑️ Clear URL History"):
+            clear_history()
+            st.rerun()
+
+url_input = st.text_input(
+    "Paste URL (Article, Recipe, OneDrive, PDF, or text):",
+    value=selected_history_url if selected_history_url else "",
+    placeholder="https://...",
+)
+
+uploaded_file = st.file_uploader(
+    "Or upload document:",
+    type=["txt", "pdf", "docx", "epub", "rtf", "md"],
+)
+
+with st.expander("📋 Manual Text / Recipe Paste (Fallback)"):
+    manual_text = st.text_area("Paste raw text or recipe directions here:", height=150)
+
+content = ""
+active_source_url = None
+
+if manual_text.strip():
+    content = format_plain_text(manual_text)
+elif url_input:
+    with st.spinner("Extracting & formatting..."):
+        result = extract_from_url(url_input)
+        if result.ok:
+            content = result.content
+            active_source_url = url_input
+        else:
+            st.error(result.message)
+elif uploaded_file:
+    with st.spinner("Formatting file..."):
+        try:
+            b = uploaded_file.read()
+            ext = uploaded_file.name.split(".")[-1].lower()
+            if ext == "pdf":
+                content = extract_pdf(b)
+            elif ext == "docx":
+                content = extract_docx(b)
+            elif ext == "epub":
+                content = extract_epub(b)
+            elif ext == "rtf":
+                content = extract_rtf(b)
+            elif ext == "md":
+                content = extract_markdown(b)
+            else:
+                content = format_plain_text(decode_bytes(b))
+        except Exception as e:
+            st.error(f"Error parsing file: {e}")
+
+# Presentation Controls & Reader Display
+if content:
+    if active_source_url:
+        save_url_to_history(active_source_url)
+
+    raw_plain_text = BeautifulSoup(content, "html.parser").get_text(separator=" ")
+    word_count = len(raw_plain_text.split())
+    reading_time_min = max(1, round(word_count / 200)) if word_count > 0 else 0
+
+    st.divider()
+
+    col_meta, col_copy = st.columns([3, 2])
+    with col_meta:
+        st.markdown(
+            f"<div class='meta-chip'>⏱️ ~{reading_time_min} min read &nbsp;•&nbsp; {word_count:,} words</div>",
+            unsafe_allow_html=True,
+        )
+    with col_copy:
+        with st.popover("📋 Copy Text"):
+            st.code(raw_plain_text, language=None)
+
+    with st.expander("⚙️ Reader Controls & Auto-Scroll", expanded=False):
+        font_family_opt = st.selectbox(
+            "Typeface",
+            ["Sans-Serif", "Serif", "Monospace"],
+            key="reader_font",
+        )
+        font_size_val = st.slider(
+            "Font Size (px)",
+            min_value=14,
+            max_value=32,
+            value=18,
+            step=1,
+            key="reader_size",
+        )
+        theme = st.selectbox(
+            "Color Theme",
+            ["Light", "Sepia", "Dark"],
+            key="reader_theme",
+        )
+
+        st.markdown("**Hands-Free Auto-Scroll**")
+        scroll_speed = st.select_slider(
+            "Scroll Speed",
+            options=["Off", "Slow", "Medium", "Fast"],
+            value="Off",
+            key="auto_scroll_speed",
+        )
+
+    speed_ms = {"Off": 0, "Slow": 70, "Medium": 40, "Fast": 20}[scroll_speed]
+
+    # Auto-scroll must run inside a real iframe (components.html) for its
+    # <script> to execute at all, and it reaches into window.parent so it
+    # scrolls the actual page rather than the (invisible) iframe itself.
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const parentWin = window.parent;
+            if (parentWin.__cleanReaderScrollTimer) {{
+                clearInterval(parentWin.__cleanReaderScrollTimer);
+                parentWin.__cleanReaderScrollTimer = null;
+            }}
+            const speedMs = {speed_ms};
+            if (speedMs > 0) {{
+                parentWin.__cleanReaderScrollTimer = setInterval(() => {{
+                    parentWin.document.documentElement.scrollBy({{ top: 1, behavior: 'smooth' }});
+                }}, speedMs);
+            }}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+    font_map = {
+        "Sans-Serif": "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+        "Serif": "Georgia, Cambria, 'Times New Roman', serif",
+        "Monospace": "Menlo, Consolas, Monaco, monospace",
+    }
+    theme_map = {
+        "Light": "background-color: #ffffff; color: #111111;",
+        "Sepia": "background-color: #fbf0d9; color: #433422;",
+        "Dark": "background-color: #1a1a1a; color: #e0e0e0;",
+    }
+
+    # Sanitize once more right before render — belt-and-suspenders, since
+    # this is the single place all content paths converge before hitting
+    # unsafe_allow_html=True.
+    safe_content = sanitize_html(content)
+
+    st.markdown(
+        f"""
+        <div class="reader-frame" style="
+            font-family: {font_map[font_family_opt]};
+            font-size: {font_size_val}px;
+            {theme_map[theme]}
+        ">
+            {safe_content}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
