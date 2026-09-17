@@ -10,3 +10,4 @@ markdown
 extruct
 bleach
 supabase
+recipe-scrapers
