@@ -1,14 +1,12 @@
 """
-Clean Reader — mobile-friendly text/recipe/article reader.
+Clean Reader — mobile-friendly text/recipe/article reader with Supabase persistence.
 """
 
 import html
 import io
 import json
 import re
-import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -26,6 +24,7 @@ from docx import Document
 from ebooklib import epub
 from pypdf import PdfReader
 from striprtf.striprtf import rtf_to_text
+from supabase import Client, create_client
 
 st.set_page_config(page_title="Clean Reader", page_icon="📖", layout="centered")
 
@@ -61,15 +60,49 @@ class ExtractResult:
 
 
 # ---------------------------------------------------------------------------
-# History (session-scoped)
+# Supabase Client Initialization
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def get_supabase_client() -> Optional[Client]:
+    url = st.secrets.get("SUPABASE_URL")
+    key = st.secrets.get("SUPABASE_KEY")
+    if not url or not key:
+        return None
+    try:
+        return create_client(url, key)
+    except Exception:
+        return None
+
+
+sb = get_supabase_client()
+
+
+# ---------------------------------------------------------------------------
+# History (Supabase `read_history` Table)
 # ---------------------------------------------------------------------------
 
 def load_history() -> list:
+    if sb:
+        try:
+            resp = sb.table("read_history").select("url").order("accessed_at", desc=True).limit(10).execute()
+            urls = []
+            for row in resp.data:
+                if row["url"] not in urls:
+                    urls.append(row["url"])
+            return urls
+        except Exception:
+            pass
     return st.session_state.get("url_history", [])
 
 
 def save_url_to_history(url: str):
-    history = load_history()
+    if sb:
+        try:
+            sb.table("read_history").insert({"url": url}).execute()
+        except Exception:
+            pass
+    history = st.session_state.get("url_history", [])
     if url in history:
         history.remove(url)
     history.insert(0, url)
@@ -77,48 +110,49 @@ def save_url_to_history(url: str):
 
 
 def clear_history():
+    if sb:
+        try:
+            sb.table("read_history").delete().neq("url", "").execute()
+        except Exception:
+            pass
     st.session_state["url_history"] = []
 
 
 # ---------------------------------------------------------------------------
-# Library (persisted parsed content)
-# NOTE: this writes to local disk, which is wiped on redeploy on Streamlit
-# Community Cloud. Tracked as a known limitation — migrating this to
-# Supabase is the planned fix (see roadmap discussion).
+# Library (Supabase `saved_articles` Table)
 # ---------------------------------------------------------------------------
 
-LIBRARY_FILE = Path("saved_articles.json")
-
-
-def load_library() -> dict:
-    if LIBRARY_FILE.exists():
+def load_library() -> list:
+    if sb:
         try:
-            return json.loads(LIBRARY_FILE.read_text(encoding="utf-8"))
+            resp = sb.table("saved_articles").select("*").order("saved_at", desc=True).execute()
+            return resp.data or []
         except Exception:
-            return {}
-    return {}
+            return []
+    return []
 
 
-def save_to_library(key_url: str, title: str, sanitized_content: str):
-    library = load_library()
-    library[key_url] = {
-        "title": title or key_url,
-        "content": sanitized_content,
-        "saved_at": time.time(),
-    }
-    try:
-        LIBRARY_FILE.write_text(json.dumps(library), encoding="utf-8")
-    except Exception:
-        pass
+def save_to_library(url: str, title: str, content: str, word_count: int):
+    if sb:
+        try:
+            sb.table("saved_articles").upsert({
+                "url": url,
+                "title": title or url,
+                "content": content,
+                "word_count": word_count,
+            }, on_conflict="url").execute()
+            return True
+        except Exception:
+            return False
+    return False
 
 
-def delete_from_library(key_url: str):
-    library = load_library()
-    library.pop(key_url, None)
-    try:
-        LIBRARY_FILE.write_text(json.dumps(library), encoding="utf-8")
-    except Exception:
-        pass
+def delete_from_library(article_id: str):
+    if sb:
+        try:
+            sb.table("saved_articles").delete().eq("id", article_id).execute()
+        except Exception:
+            pass
 
 
 def guess_title(sanitized_content: str, fallback: str) -> str:
@@ -130,9 +164,6 @@ def guess_title(sanitized_content: str, fallback: str) -> str:
 
 
 def to_plain_text_for_export(sanitized_content: str) -> str:
-    """Simple, shareable plain-text rendering — good for pasting a recipe
-    into an email or text message. Headings are upper-cased, list items
-    get a leading dash, everything else stays as plain paragraphs."""
     soup = BeautifulSoup(sanitized_content, "html.parser")
     lines = []
     for el in soup.find_all(["h1", "h2", "h3", "h4", "p", "li"]):
@@ -252,10 +283,6 @@ def extract_recipe_schema(html_content: str):
 
 
 def find_recipe_section_by_anchor(raw_html: str) -> Optional[str]:
-    """Look for a 'Jump to Recipe' style link and, if found, return only the
-    HTML it points to — trimming the preamble story most recipe blogs put
-    before the actual recipe. Returns None if nothing convincing is found,
-    so the caller keeps using normal article extraction."""
     soup = BeautifulSoup(raw_html, "html.parser")
 
     anchor = soup.find(
@@ -446,14 +473,6 @@ def render_reader(
     theme_style: str,
     pane_height: int = 600,
 ):
-    """Renders the article in a self-contained iframe with its own toolbar:
-    a scroll start/pause toggle, three speed presets, and a read-aloud
-    toggle using the browser's built-in SpeechSynthesis API. All of this
-    lives in plain JS inside the iframe (not Streamlit widgets), so using
-    it does NOT trigger a Streamlit rerun and won't interrupt playback.
-    Changing font/theme/pane-height (real Streamlit widgets) WILL rebuild
-    the iframe and reset playback — that's an inherent Streamlit tradeoff,
-    not a bug."""
     tts_text_json = json.dumps(plain_text_for_tts)
 
     doc = f"""
@@ -513,7 +532,6 @@ def render_reader(
         scrollEl.addEventListener('scroll', updateProgress);
         updateProgress();
 
-        // --- Auto-scroll: start/pause + speed ---
         let scrollTimer = null;
         let scrollSpeedMs = 40;
         let scrollActive = false;
@@ -548,7 +566,6 @@ def render_reader(
           }});
         }});
 
-        // --- Read Aloud (SpeechSynthesis) ---
         const ttsFullText = {tts_text_json};
         let ttsChunks = [];
         let ttsIndex = 0;
@@ -610,11 +627,14 @@ def render_reader(
 # ---------------------------------------------------------------------------
 st.title("📖 Clean 9:16 Reader")
 
+if not sb:
+    st.info("💡 Supabase not configured in secrets. Operating in session-only mode.")
+
 history_list = load_history()
 selected_history_url = None
 
 if history_list:
-    with st.expander("🕒 Recent URLs (Last 10)", expanded=False):
+    with st.expander("🕒 Recent URLs (Supabase History)", expanded=False):
         chosen = st.selectbox(
             "Select a previously accessed page:",
             options=["-- Select from history --"] + history_list,
@@ -627,32 +647,33 @@ if history_list:
             clear_history()
             st.rerun()
 
-library = load_library()
+library_items = load_library()
 loaded_from_library = None
 
-if library:
-    with st.expander("📚 Saved Articles (offline)", expanded=False):
-        for key, entry in sorted(library.items(), key=lambda kv: kv[1]["saved_at"], reverse=True):
+if library_items:
+    with st.expander(f"📚 Saved Articles ({len(library_items)})", expanded=False):
+        for entry in library_items:
+            art_id = entry["id"]
             col_title, col_open, col_txt, col_html, col_del = st.columns([4, 1.3, 1, 1, 1])
-            col_title.write(entry["title"])
-            if col_open.button("Open", key=f"open_{key}"):
+            col_title.write(entry.get("title", entry.get("url", "Untitled")))
+            if col_open.button("Open", key=f"open_{art_id}"):
                 loaded_from_library = entry["content"]
             col_txt.download_button(
                 "⬇️ .txt",
                 data=to_plain_text_for_export(entry["content"]),
-                file_name=f"{entry['title'][:60]}.txt",
+                file_name=f"{entry.get('title', 'article')[:60]}.txt",
                 mime="text/plain",
-                key=f"dl_txt_{key}",
+                key=f"dl_txt_{art_id}",
             )
             col_html.download_button(
                 "⬇️ .html",
                 data=entry["content"],
-                file_name=f"{entry['title'][:60]}.html",
+                file_name=f"{entry.get('title', 'article')[:60]}.html",
                 mime="text/html",
-                key=f"dl_html_{key}",
+                key=f"dl_html_{art_id}",
             )
-            if col_del.button("🗑️", key=f"del_{key}"):
-                delete_from_library(key)
+            if col_del.button("🗑️", key=f"del_{art_id}"):
+                delete_from_library(art_id)
                 st.rerun()
 
 url_input = st.text_input(
@@ -724,12 +745,15 @@ if content:
         with st.popover("📋 Copy Text"):
             st.code(raw_plain_text, language=None)
 
-    if active_source_url:
-        if st.button("💾 Save to Library (read offline later)"):
-            sanitized = sanitize_html(content)
-            title = guess_title(sanitized, fallback=active_source_url)
-            save_to_library(active_source_url, title, sanitized)
-            st.success("Saved for offline reading.")
+    save_key = active_source_url or f"upload_{hash(content[:60])}"
+    if st.button("💾 Save to Supabase Library (read offline later)"):
+        sanitized = sanitize_html(content)
+        title = guess_title(sanitized, fallback=active_source_url or "Uploaded Document")
+        if save_to_library(save_key, title, sanitized, word_count):
+            st.success("Saved to Supabase.")
+            st.rerun()
+        else:
+            st.error("Could not save to Supabase. Check database connections and logs.")
 
     with st.expander("⚙️ Reader Controls", expanded=False):
         font_family_opt = st.selectbox("Typeface", ["Sans-Serif", "Serif", "Monospace"], key="reader_font")
