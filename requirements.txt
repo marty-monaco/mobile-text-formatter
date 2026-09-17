@@ -9,3 +9,4 @@ striprtf
 markdown
 extruct
 bleach
+supabase
