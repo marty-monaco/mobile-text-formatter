@@ -1,6 +1,6 @@
 """
 Clean Reader — mobile-friendly text/recipe/article reader with Supabase persistence,
-recipe-scraper fallbacks, and Internet Archive (Wayback Machine) recovery.
+recipe-scraper fallbacks, Internet Archive recovery, and JS-blocker resolution.
 """
 
 import html
@@ -389,7 +389,7 @@ def find_recipe_section_by_anchor(raw_html: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Bypass Gateways (Wayback Machine & Jina Reader)
+# Bypass Gateways (Wayback Machine & Jina Reader Engine)
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -432,9 +432,16 @@ def fetch_archive_org_snapshot(target_url: str) -> Optional[Tuple[str, str]]:
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_jina_proxy(target_url: str) -> str:
     proxy_url = f"https://r.jina.ai/{target_url}"
-    resp = requests.get(proxy_url, impersonate="chrome124", timeout=20)
-    if resp.status_code == 200 and resp.text.strip():
-        return sanitize_html(markdown.markdown(resp.text))
+    try:
+        resp = requests.get(proxy_url, impersonate="chrome124", timeout=25)
+        if resp.status_code == 200 and resp.text.strip():
+            # Check that Jina didn't also capture a JS barrier
+            lower_text = resp.text.lower()
+            if "enable javascript" in lower_text or "javascript is required" in lower_text:
+                return ""
+            return sanitize_html(markdown.markdown(resp.text))
+    except Exception:
+        return ""
     return ""
 
 
@@ -488,17 +495,26 @@ def extract_from_url(raw_input: str, prefer_wayback: bool = False) -> ExtractRes
         status = 500
         body_text = ""
 
+    # Bot mitigation / IP wall / JS verification checks
     anti_bot_patterns = [
         "icanhazip.com",
         "contentlicensing@people.inc",
         "captcha-delivery.com",
         "access denied",
+        "enable javascript",
+        "please enable javascript",
+        "turn javascript on",
+        "javascript is disabled",
+        "requires javascript",
+        "please turn on javascript",
     ]
+
     is_blocked = (
         status in (403, 429, 500)
         or any(pat in body_text.lower() for pat in anti_bot_patterns)
     )
 
+    # If the page loaded without a firewall or JS barrier
     if not is_blocked and body_text:
         content_type = resp.headers.get("content-type", "").lower()
         content_disp = resp.headers.get("content-disposition", "").lower()
@@ -544,9 +560,15 @@ def extract_from_url(raw_input: str, prefer_wayback: bool = False) -> ExtractRes
         if not body:
             body = trafilatura.extract(body_text, favor_recall=True)
 
-        if body:
+        if body and not any(p in body.lower() for p in ("enable javascript", "javascript is disabled")):
             return ExtractResult(ok=True, content=format_plain_text(body))
 
+    # Fallback 1: Headless JS Reader (Jina AI chromium worker renders dynamic JS/SPAs)
+    proxy_content = fetch_jina_proxy(clean_url)
+    if proxy_content:
+        return ExtractResult(ok=True, content=proxy_content)
+
+    # Fallback 2: Internet Archive (Wayback Machine snapshot)
     archive_res = fetch_archive_org_snapshot(clean_url)
     if archive_res:
         arch_html, arch_date = archive_res
@@ -560,13 +582,9 @@ def extract_from_url(raw_input: str, prefer_wayback: bool = False) -> ExtractRes
         if body:
             return ExtractResult(ok=True, content=f"<p class='meta-chip'>🏛️ Snapshot ({arch_date})</p>{format_plain_text(body)}")
 
-    proxy_content = fetch_jina_proxy(clean_url)
-    if proxy_content:
-        return ExtractResult(ok=True, content=proxy_content)
-
     return ExtractResult(
         ok=False,
-        message="Site firewalls blocked direct access and no archive was found. Paste text into the box below.",
+        message="This page requires JavaScript or blocked access, and no working snapshot was found. Paste text into the box below.",
     )
 
 
