@@ -1,5 +1,6 @@
 """
-Clean Reader — mobile-friendly text/recipe/article reader with Supabase persistence.
+Clean Reader — mobile-friendly text/recipe/article reader with Supabase persistence,
+recipe-scraper fallbacks, and Internet Archive (Wayback Machine) recovery.
 """
 
 import html
@@ -7,7 +8,7 @@ import io
 import json
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 import bleach
@@ -23,6 +24,7 @@ from curl_cffi.requests.exceptions import SSLError
 from docx import Document
 from ebooklib import epub
 from pypdf import PdfReader
+from recipe_scrapers import scrape_me
 from striprtf.striprtf import rtf_to_text
 from supabase import Client, create_client
 
@@ -60,7 +62,7 @@ class ExtractResult:
 
 
 # ---------------------------------------------------------------------------
-# Supabase Client Initialization
+# Supabase Client & Database Persistence
 # ---------------------------------------------------------------------------
 
 @st.cache_resource
@@ -77,10 +79,6 @@ def get_supabase_client() -> Optional[Client]:
 
 sb = get_supabase_client()
 
-
-# ---------------------------------------------------------------------------
-# History (Supabase `read_history` Table)
-# ---------------------------------------------------------------------------
 
 def load_history() -> list:
     if sb:
@@ -118,10 +116,6 @@ def clear_history():
     st.session_state["url_history"] = []
 
 
-# ---------------------------------------------------------------------------
-# Library (Supabase `saved_articles` Table)
-# ---------------------------------------------------------------------------
-
 def load_library() -> list:
     if sb:
         try:
@@ -132,7 +126,7 @@ def load_library() -> list:
     return []
 
 
-def save_to_library(url: str, title: str, content: str, word_count: int):
+def save_to_library(url: str, title: str, content: str, word_count: int) -> bool:
     if sb:
         try:
             sb.table("saved_articles").upsert({
@@ -180,7 +174,7 @@ def to_plain_text_for_export(sanitized_content: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Mobile scaffolding / PWA metas
+# Mobile Scaffolding / PWA Metas
 # ---------------------------------------------------------------------------
 st.markdown(
     """
@@ -268,6 +262,51 @@ def extract_markdown(file_bytes: bytes) -> str:
     return sanitize_html(markdown.markdown(decode_bytes(file_bytes)))
 
 
+# ---------------------------------------------------------------------------
+# Recipe Extractors (recipe-scrapers, JSON-LD Schema, & DOM Fallbacks)
+# ---------------------------------------------------------------------------
+
+def extract_recipe_via_scraper(url: str, html_str: Optional[str] = None) -> Optional[str]:
+    try:
+        if html_str:
+            scraper = scrape_me(url, html=html_str)
+        else:
+            scraper = scrape_me(url)
+
+        title = scraper.title()
+        ingredients = scraper.ingredients()
+        instructions = scraper.instructions().split("\n")
+        yields = scraper.yields()
+        total_time = scraper.total_time()
+
+        out = [f"<h2>{html.escape(title)}</h2>"]
+
+        meta = []
+        if yields:
+            meta.append(f"Yield: {html.escape(yields)}")
+        if total_time:
+            meta.append(f"Total Time: {total_time} mins")
+        if meta:
+            out.append(f"<p class='meta-chip'><em>{' | '.join(meta)}</em></p>")
+
+        if ingredients:
+            out.append("<h3>Ingredients</h3><ul>")
+            for item in ingredients:
+                out.append(f"<li>{html.escape(item)}</li>")
+            out.append("</ul>")
+
+        if instructions:
+            out.append("<h3>Directions</h3><ol>")
+            for step in instructions:
+                if step.strip():
+                    out.append(f"<li>{html.escape(step.strip())}</li>")
+            out.append("</ol>")
+
+        return "".join(out)
+    except Exception:
+        return None
+
+
 def extract_recipe_schema(html_content: str):
     try:
         data = extruct.extract(html_content, syntaxes=["json-ld"])
@@ -280,45 +319,6 @@ def extract_recipe_schema(html_content: str):
     except Exception:
         return None
     return None
-
-
-def find_recipe_section_by_anchor(raw_html: str) -> Optional[str]:
-    soup = BeautifulSoup(raw_html, "html.parser")
-
-    anchor = soup.find(
-        lambda tag: tag.name in ("a", "button")
-        and tag.get_text(strip=True)
-        and re.search(r"jump\s*to\s*recipe|go\s*to\s*recipe|print\s*recipe", tag.get_text(strip=True), re.I)
-    )
-    if not anchor:
-        return None
-
-    target_id = None
-    href = anchor.get("href", "")
-    if href.startswith("#"):
-        target_id = href[1:]
-    target_id = target_id or anchor.get("data-target") or anchor.get("aria-controls")
-
-    target = soup.find(id=target_id) if target_id else None
-
-    if not target:
-        target = soup.find(
-            lambda tag: tag.get("id") and "recipe" in tag.get("id", "").lower()
-        ) or soup.find(
-            lambda tag: tag.get("class")
-            and any(
-                any(marker in c.lower() for marker in ("recipe-card", "tasty-recipe", "wprm-recipe"))
-                for c in tag.get("class", [])
-            )
-        )
-
-    if not target:
-        return None
-
-    if len(target.find_all("li")) < 2:
-        return None
-
-    return str(target)
 
 
 def format_recipe_output(recipe: dict) -> str:
@@ -353,6 +353,82 @@ def format_recipe_output(recipe: dict) -> str:
     return "".join(out)
 
 
+def find_recipe_section_by_anchor(raw_html: str) -> Optional[str]:
+    soup = BeautifulSoup(raw_html, "html.parser")
+    anchor = soup.find(
+        lambda tag: tag.name in ("a", "button")
+        and tag.get_text(strip=True)
+        and re.search(r"jump\s*to\s*recipe|go\s*to\s*recipe|print\s*recipe", tag.get_text(strip=True), re.I)
+    )
+    if not anchor:
+        return None
+
+    target_id = None
+    href = anchor.get("href", "")
+    if href.startswith("#"):
+        target_id = href[1:]
+    target_id = target_id or anchor.get("data-target") or anchor.get("aria-controls")
+
+    target = soup.find(id=target_id) if target_id else None
+
+    if not target:
+        target = soup.find(
+            lambda tag: tag.get("id") and "recipe" in tag.get("id", "").lower()
+        ) or soup.find(
+            lambda tag: tag.get("class")
+            and any(
+                any(marker in c.lower() for marker in ("recipe-card", "tasty-recipe", "wprm-recipe"))
+                for c in tag.get("class", [])
+            )
+        )
+
+    if not target or len(target.find_all("li")) < 2:
+        return None
+
+    return str(target)
+
+
+# ---------------------------------------------------------------------------
+# Bypass Gateways (Wayback Machine & Jina Reader)
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_archive_org_snapshot(target_url: str) -> Optional[Tuple[str, str]]:
+    try:
+        api_url = f"https://archive.org/wayback/available?url={target_url}"
+        resp = requests.get(api_url, timeout=10)
+        if resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        closest = data.get("archived_snapshots", {}).get("closest")
+        if not closest or not closest.get("available"):
+            return None
+
+        raw_url = closest.get("url", "")
+        timestamp = closest.get("timestamp", "")
+
+        clean_snapshot_url = re.sub(r"/web/(\d{14})/", r"/web/\1id_/", raw_url)
+        if "id_/" not in clean_snapshot_url:
+            clean_snapshot_url = raw_url.replace(f"/web/{timestamp}/", f"/web/{timestamp}id_/")
+
+        archive_resp = requests.get(
+            clean_snapshot_url,
+            impersonate="chrome124",
+            timeout=15,
+            allow_redirects=True,
+        )
+        if archive_resp.status_code == 200 and len(archive_resp.text.strip()) > 300:
+            date_formatted = (
+                f"{timestamp[:4]}-{timestamp[4:6]}-{timestamp[6:8]}"
+                if len(timestamp) >= 8 else "Archived"
+            )
+            return archive_resp.text, date_formatted
+    except Exception:
+        return None
+    return None
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_jina_proxy(target_url: str) -> str:
     proxy_url = f"https://r.jina.ai/{target_url}"
@@ -362,8 +438,12 @@ def fetch_jina_proxy(target_url: str) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Core URL Extractor Engine
+# ---------------------------------------------------------------------------
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def extract_from_url(raw_input: str) -> ExtractResult:
+def extract_from_url(raw_input: str, prefer_wayback: bool = False) -> ExtractResult:
     match = re.search(r"(https?://[^\s]+)", raw_input.strip())
     if not match:
         return ExtractResult(ok=False, message="Please enter a valid URL starting with http:// or https://")
@@ -379,6 +459,17 @@ def extract_from_url(raw_input: str) -> ExtractResult:
         if "download=1" not in clean_url:
             clean_url += ("&" if "?" in clean_url else "?") + "download=1"
 
+    if prefer_wayback:
+        archive_res = fetch_archive_org_snapshot(clean_url)
+        if archive_res:
+            arch_html, arch_date = archive_res
+            recipe = extract_recipe_via_scraper(clean_url, html_str=arch_html)
+            if recipe:
+                return ExtractResult(ok=True, content=f"<p class='meta-chip'>🏛️ Snapshot ({arch_date})</p>{recipe}")
+            body = trafilatura.extract(arch_html, favor_recall=True)
+            if body:
+                return ExtractResult(ok=True, content=f"<p class='meta-chip'>🏛️ Snapshot ({arch_date})</p>{format_plain_text(body)}")
+
     try:
         resp = requests.get(
             clean_url,
@@ -386,84 +477,102 @@ def extract_from_url(raw_input: str) -> ExtractResult:
             timeout=15,
             allow_redirects=True,
         )
+        status = resp.status_code
+        body_text = resp.text
     except SSLError:
         return ExtractResult(
             ok=False,
-            message=(
-                "This site's TLS certificate could not be verified, so the page "
-                "was not fetched for your safety. Try the manual paste box below instead."
-            ),
+            message="This site's TLS certificate could not be verified. Use the manual paste box below.",
         )
     except Exception:
-        proxy_content = fetch_jina_proxy(clean_url)
-        if proxy_content:
-            return ExtractResult(ok=True, content=proxy_content)
-        return ExtractResult(ok=False, message="Failed to fetch this URL.")
+        status = 500
+        body_text = ""
 
-    anti_bot_patterns = ["icanhazip.com", "contentlicensing@people.inc", "captcha-delivery.com"]
+    anti_bot_patterns = [
+        "icanhazip.com",
+        "contentlicensing@people.inc",
+        "captcha-delivery.com",
+        "access denied",
+    ]
     is_blocked = (
-        resp.status_code in (403, 429)
-        or any(pat in resp.text for pat in anti_bot_patterns)
+        status in (403, 429, 500)
+        or any(pat in body_text.lower() for pat in anti_bot_patterns)
     )
 
-    if is_blocked:
-        proxy_content = fetch_jina_proxy(clean_url)
-        if proxy_content:
-            return ExtractResult(ok=True, content=proxy_content)
-        return ExtractResult(
-            ok=False,
-            message="This site blocked direct access. Please paste the article/recipe text into the manual box below.",
-        )
+    if not is_blocked and body_text:
+        content_type = resp.headers.get("content-type", "").lower()
+        content_disp = resp.headers.get("content-disposition", "").lower()
+        final_url = resp.url.lower()
 
-    content_type = resp.headers.get("content-type", "").lower()
-    content_disp = resp.headers.get("content-disposition", "").lower()
-    final_url = resp.url.lower()
+        if "application/pdf" in content_type or final_url.endswith(".pdf") or ".pdf" in content_disp:
+            return ExtractResult(ok=True, content=extract_pdf(resp.content))
 
-    if "application/pdf" in content_type or final_url.endswith(".pdf") or ".pdf" in content_disp:
-        return ExtractResult(ok=True, content=extract_pdf(resp.content))
+        if (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document" in content_type
+            or final_url.endswith(".docx")
+            or ".docx" in content_disp
+        ):
+            return ExtractResult(ok=True, content=extract_docx(resp.content))
 
-    if (
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" in content_type
-        or final_url.endswith(".docx")
-        or ".docx" in content_disp
-    ):
-        return ExtractResult(ok=True, content=extract_docx(resp.content))
+        if "application/epub+zip" in content_type or final_url.endswith(".epub") or ".epub" in content_disp:
+            return ExtractResult(ok=True, content=extract_epub(resp.content))
 
-    if "application/epub+zip" in content_type or final_url.endswith(".epub") or ".epub" in content_disp:
-        return ExtractResult(ok=True, content=extract_epub(resp.content))
+        if (
+            "application/rtf" in content_type
+            or "text/rtf" in content_type
+            or final_url.endswith(".rtf")
+            or ".rtf" in content_disp
+        ):
+            return ExtractResult(ok=True, content=extract_rtf(resp.content))
 
-    if (
-        "application/rtf" in content_type
-        or "text/rtf" in content_type
-        or final_url.endswith(".rtf")
-        or ".rtf" in content_disp
-    ):
-        return ExtractResult(ok=True, content=extract_rtf(resp.content))
+        if "text/plain" in content_type or final_url.endswith(".txt") or ".txt" in content_disp:
+            return ExtractResult(ok=True, content=format_plain_text(resp.text))
 
-    if "text/plain" in content_type or final_url.endswith(".txt") or ".txt" in content_disp:
-        return ExtractResult(ok=True, content=format_plain_text(resp.text))
+        recipe_scraped = extract_recipe_via_scraper(clean_url, html_str=body_text)
+        if recipe_scraped:
+            return ExtractResult(ok=True, content=recipe_scraped)
 
-    recipe_data = extract_recipe_schema(resp.text)
-    if recipe_data:
-        return ExtractResult(ok=True, content=format_recipe_output(recipe_data))
+        recipe_data = extract_recipe_schema(body_text)
+        if recipe_data:
+            return ExtractResult(ok=True, content=format_recipe_output(recipe_data))
 
-    recipe_section_html = find_recipe_section_by_anchor(resp.text)
-    if recipe_section_html:
-        return ExtractResult(ok=True, content=sanitize_html(recipe_section_html))
+        recipe_section_html = find_recipe_section_by_anchor(body_text)
+        if recipe_section_html:
+            return ExtractResult(ok=True, content=sanitize_html(recipe_section_html))
 
-    body = trafilatura.extract(resp.text, include_comments=False)
-    if not body:
-        body = trafilatura.extract(resp.text, favor_recall=True)
+        body = trafilatura.extract(body_text, include_comments=False)
+        if not body:
+            body = trafilatura.extract(body_text, favor_recall=True)
 
-    if body:
-        return ExtractResult(ok=True, content=format_plain_text(body))
+        if body:
+            return ExtractResult(ok=True, content=format_plain_text(body))
+
+    archive_res = fetch_archive_org_snapshot(clean_url)
+    if archive_res:
+        arch_html, arch_date = archive_res
+        recipe = extract_recipe_via_scraper(clean_url, html_str=arch_html)
+        if recipe:
+            return ExtractResult(ok=True, content=f"<p class='meta-chip'>🏛️ Snapshot ({arch_date})</p>{recipe}")
+        recipe_data = extract_recipe_schema(arch_html)
+        if recipe_data:
+            return ExtractResult(ok=True, content=f"<p class='meta-chip'>🏛️ Snapshot ({arch_date})</p>{format_recipe_output(recipe_data)}")
+        body = trafilatura.extract(arch_html, favor_recall=True)
+        if body:
+            return ExtractResult(ok=True, content=f"<p class='meta-chip'>🏛️ Snapshot ({arch_date})</p>{format_plain_text(body)}")
 
     proxy_content = fetch_jina_proxy(clean_url)
     if proxy_content:
         return ExtractResult(ok=True, content=proxy_content)
 
-    return ExtractResult(ok=False, message="Unable to extract readable content from this page.")
+    return ExtractResult(
+        ok=False,
+        message="Site firewalls blocked direct access and no archive was found. Paste text into the box below.",
+    )
 
+
+# ---------------------------------------------------------------------------
+# Display Engine: Sandboxed Frame with Native JS Toolbar
+# ---------------------------------------------------------------------------
 
 def render_reader(
     html_content: str,
@@ -503,6 +612,7 @@ def render_reader(
           padding: 1.25rem 1rem;
       }}
       .reader-frame p {{ margin-bottom: 1.35em; line-height: 1.8; }}
+      .meta-chip {{ font-size: 0.85rem; color: #888888; margin-bottom: 0.75rem; }}
     </style>
     <div id="progress-container"><div id="progress-bar"></div></div>
     <div id="toolbar">
@@ -623,18 +733,18 @@ def render_reader(
 
 
 # ---------------------------------------------------------------------------
-# UI Layout
+# UI Entrypoint
 # ---------------------------------------------------------------------------
 st.title("📖 Clean 9:16 Reader")
 
 if not sb:
-    st.info("💡 Supabase not configured in secrets. Operating in session-only mode.")
+    st.info("💡 Supabase not connected. Operating in session memory mode.")
 
 history_list = load_history()
 selected_history_url = None
 
 if history_list:
-    with st.expander("🕒 Recent URLs (Supabase History)", expanded=False):
+    with st.expander("🕒 Recent URLs", expanded=False):
         chosen = st.selectbox(
             "Select a previously accessed page:",
             options=["-- Select from history --"] + history_list,
@@ -643,7 +753,7 @@ if history_list:
         if chosen != "-- Select from history --":
             selected_history_url = chosen
 
-        if st.button("🗑️ Clear URL History"):
+        if st.button("🗑️ Clear History"):
             clear_history()
             st.rerun()
 
@@ -676,11 +786,17 @@ if library_items:
                 delete_from_library(art_id)
                 st.rerun()
 
-url_input = st.text_input(
-    "Paste URL (Article, Recipe, OneDrive, PDF, or text):",
-    value=selected_history_url if selected_history_url else "",
-    placeholder="https://...",
-)
+col_input, col_ia_check = st.columns([3, 1])
+with col_input:
+    url_input = st.text_input(
+        "Paste URL (Article, Recipe, OneDrive, PDF, or text):",
+        value=selected_history_url if selected_history_url else "",
+        placeholder="https://...",
+    )
+with col_ia_check:
+    st.write("")
+    st.write("")
+    use_wayback = st.checkbox("🏛️ Wayback", help="Force retrieval from Internet Archive snapshot")
 
 uploaded_file = st.file_uploader(
     "Or upload document:",
@@ -699,7 +815,7 @@ elif manual_text.strip():
     content = format_plain_text(manual_text)
 elif url_input:
     with st.spinner("Extracting & formatting..."):
-        result = extract_from_url(url_input)
+        result = extract_from_url(url_input, prefer_wayback=use_wayback)
         if result.ok:
             content = result.content
             active_source_url = url_input
@@ -753,7 +869,7 @@ if content:
             st.success("Saved to Supabase.")
             st.rerun()
         else:
-            st.error("Could not save to Supabase. Check database connections and logs.")
+            st.error("Could not save to Supabase. Verify database connections.")
 
     with st.expander("⚙️ Reader Controls", expanded=False):
         font_family_opt = st.selectbox("Typeface", ["Sans-Serif", "Serif", "Monospace"], key="reader_font")
@@ -762,7 +878,7 @@ if content:
         pane_height_val = st.slider(
             "Reading Pane Height (px)", min_value=400, max_value=1000, value=600, step=50, key="reader_pane_height"
         )
-        st.caption("Scroll and read-aloud controls are in the toolbar above the article itself.")
+        st.caption("Scroll and read-aloud controls are located in the top toolbar of the reader below.")
 
     font_map = {
         "Sans-Serif": "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
