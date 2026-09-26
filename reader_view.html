@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      font-family: -apple-system, sans-serif;
+    }
+
+    /* Fixed top scroll-progress indicator */
+    #progress-container {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 6px;
+      background: rgba(128, 128, 128, 0.2);
+      z-index: 9999;
+    }
+    #progress-bar {
+      width: 0%;
+      height: 100%;
+      background-color: #ff4b4b;
+      transition: width 0.1s ease-out;
+    }
+
+    /* Action bar controls
+       IMPORTANT: nowrap + horizontal scroll instead of flex-wrap.
+       The outer iframe height is a fixed pixel value computed in Python
+       (pane_height + 70) that assumes a single-row toolbar. On narrow
+       mobile viewports flex-wrap pushed this onto 2-3 rows, which grew
+       taller than that budget; since the iframe has scrolling disabled
+       and nothing measures/reports real content height back to it,
+       anything past the fixed frame edge was simply invisible with no
+       way to reach it. Keeping the toolbar single-row and scrollable
+       sideways keeps its height constant on every screen size. */
+    #toolbar {
+      display: flex;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 8px 6px 8px;
+      background: #f2f2f2;
+      border-bottom: 1px solid #ddd;
+      margin-top: 6px;
+      scrollbar-width: thin;
+    }
+    .ctrl-btn, .speed-btn {
+      flex-shrink: 0;
+      border: 1px solid #ccc;
+      background: #fff;
+      color: #222;
+      border-radius: 999px;
+      padding: 6px 12px;
+      font-size: 13px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .speed-btn.active {
+      background: #ff4b4b;
+      color: #fff;
+      border-color: #ff4b4b;
+    }
+    .speed-group {
+      display: flex;
+      flex-shrink: 0;
+      gap: 4px;
+    }
+
+    /* Reader view scroll container */
+    #reader-scroll {
+      height: {{ pane_height }}px;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      box-sizing: border-box;
+    }
+    .reader-frame {
+      font-family: {{ font_family }};
+      font-size: {{ font_size }}px;
+      {{ theme_style }}
+      padding: 1.25rem 1rem;
+    }
+    .reader-frame p {
+      margin-bottom: 1.35em;
+      line-height: 1.8;
+    }
+    .meta-chip {
+      font-size: 0.85rem;
+      color: #888888;
+      margin-bottom: 0.75rem;
+    }
+  </style>
+</head>
+<body>
+  <div id="progress-container">
+    <div id="progress-bar"></div>
+  </div>
+
+  <div id="toolbar">
+    <button id="scrollToggleBtn" class="ctrl-btn">▶️ Start Scroll</button>
+    <span class="speed-group">
+      <button class="speed-btn" data-ms="70">Slow</button>
+      <button class="speed-btn active" data-ms="40">Medium</button>
+      <button class="speed-btn" data-ms="20">Fast</button>
+    </span>
+    <button id="ttsBtn" class="ctrl-btn">🔊 Read Aloud</button>
+  </div>
+
+  <div id="reader-scroll">
+    <div class="reader-frame">
+      {{ content }}
+    </div>
+  </div>
+
+  <script>
+    (function() {
+      const scrollEl = document.getElementById('reader-scroll');
+      const bar = document.getElementById('progress-bar');
+      const scrollToggleBtn = document.getElementById('scrollToggleBtn');
+      const ttsBtn = document.getElementById('ttsBtn');
+      const speedBtns = document.querySelectorAll('.speed-btn');
+
+      // Update progress bar as user or auto-scroller navigates
+      function updateProgress() {
+        const total = scrollEl.scrollHeight - scrollEl.clientHeight;
+        if (total > 0) {
+          bar.style.width = (scrollEl.scrollTop / total * 100) + '%';
+        }
+      }
+      scrollEl.addEventListener('scroll', updateProgress);
+      updateProgress();
+
+      // Auto-scrolling state & controls
+      let scrollTimer = null;
+      let scrollSpeedMs = 40;
+      let scrollActive = false;
+
+      function startScrolling() {
+        if (scrollTimer) clearInterval(scrollTimer);
+        scrollTimer = setInterval(() => {
+          scrollEl.scrollBy({ top: 1, behavior: 'auto' });
+        }, scrollSpeedMs);
+      }
+
+      function stopScrolling() {
+        if (scrollTimer) {
+          clearInterval(scrollTimer);
+          scrollTimer = null;
+        }
+      }
+
+      scrollToggleBtn.addEventListener('click', () => {
+        scrollActive = !scrollActive;
+        if (scrollActive) {
+          startScrolling();
+          scrollToggleBtn.textContent = '⏸ Pause Scroll';
+        } else {
+          stopScrolling();
+          scrollToggleBtn.textContent = '▶️ Start Scroll';
+        }
+      });
+
+      speedBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+          speedBtns.forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+          scrollSpeedMs = parseInt(btn.dataset.ms, 10);
+          if (scrollActive) startScrolling();
+        });
+      });
+
+      // Text-to-Speech (TTS) Chunking & Queue
+      const ttsFullText = {{ tts_text_json }};
+      let ttsChunks = [];
+      let ttsIndex = 0;
+      let ttsSpeaking = false;
+
+      function chunkText(text) {
+        const sentences = text.match(/[^.!?]+[.!?]*/g) || [text];
+        const chunks = [];
+        let current = "";
+        for (const s of sentences) {
+          if ((current + s).length > 200 && current) {
+            chunks.push(current.trim());
+            current = s;
+          } else {
+            current += s;
+          }
+        }
+        if (current.trim()) chunks.push(current.trim());
+        return chunks;
+      }
+
+      function speakNext() {
+        if (ttsIndex >= ttsChunks.length) {
+          ttsSpeaking = false;
+          ttsBtn.textContent = '🔊 Read Aloud';
+          return;
+        }
+        const utter = new SpeechSynthesisUtterance(ttsChunks[ttsIndex]);
+        utter.onend = () => {
+          ttsIndex += 1;
+          speakNext();
+        };
+        window.speechSynthesis.speak(utter);
+      }
+
+      ttsBtn.addEventListener('click', () => {
+        if (!ttsSpeaking) {
+          if (window.speechSynthesis.paused) {
+            window.speechSynthesis.resume();
+          } else {
+            ttsChunks = chunkText(ttsFullText);
+            ttsIndex = 0;
+            window.speechSynthesis.cancel();
+            speakNext();
+          }
+          ttsSpeaking = true;
+          ttsBtn.textContent = '⏸ Pause Reading';
+        } else {
+          window.speechSynthesis.pause();
+          ttsSpeaking = false;
+          ttsBtn.textContent = '▶️ Resume Reading';
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
