@@ -7,8 +7,8 @@ import hashlib
 import html
 import io
 import json
-import os
 import re
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit, urlparse
@@ -619,28 +619,30 @@ def render_reader(
     theme_style: str,
     pane_height: int = 600,
 ):
-    template_path = os.path.join(os.path.dirname(__file__), "reader_view.html")
-    if os.path.exists(template_path):
-        with open(template_path, "r", encoding="utf-8") as f:
-            template = f.read()
+    # Resolved relative to this script's own location, not the process's
+    # current working directory, so it doesn't break under a different
+    # launch WORKDIR (Docker, systemd, a process manager, etc.).
+    template_path = Path(__file__).parent / "reader_view.html"
+    if template_path.exists():
+        template = template_path.read_text(encoding="utf-8")
     else:
-        # Fallback inline if template is missing
+        # Fallback inline if the template file is missing.
         template = (
-            "<div style='__THEME_STYLE__ font-family:__FONT_FAMILY__; "
-            "font-size:__FONT_SIZE__px; padding:16px; min-height:__PANE_HEIGHT__px;'>"
-            "__HTML_CONTENT__"
-            "<script>window.__TTS_TEXT__ = __TTS_TEXT_JSON__;</script>"
+            "<div style='{{ theme_style }} font-family:{{ font_family }}; "
+            "font-size:{{ font_size }}px; padding:16px; min-height:{{ pane_height }}px;'>"
+            "{{ content }}"
+            "<script>window.__TTS_TEXT__ = {{ tts_text_json }};</script>"
             "</div>"
         )
 
     doc = (
         template
-        .replace("__PANE_HEIGHT__", str(pane_height))
-        .replace("__FONT_FAMILY__", font_family)
-        .replace("__FONT_SIZE__", str(font_size))
-        .replace("__THEME_STYLE__", theme_style)
-        .replace("__HTML_CONTENT__", html_content)
-        .replace("__TTS_TEXT_JSON__", json.dumps(plain_text_for_tts))
+        .replace("{{ pane_height }}", str(pane_height))
+        .replace("{{ font_family }}", font_family)
+        .replace("{{ font_size }}", str(font_size))
+        .replace("{{ theme_style }}", theme_style)
+        .replace("{{ content }}", html_content)
+        .replace("{{ tts_text_json }}", json.dumps(plain_text_for_tts))
     )
     components.html(doc, height=pane_height + 70, scrolling=False)
 
