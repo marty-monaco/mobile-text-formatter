@@ -1,15 +1,17 @@
 """
 Clean Reader — mobile-friendly text/recipe/article reader with Supabase persistence,
-recipe-scraper fallbacks, Internet Archive recovery, and JS-blocker resolution.
+Internet Archive recovery, and dedicated Medium/Substack extraction.
 """
 
+import hashlib
 import html
 import io
 import json
+import os
 import re
 from dataclasses import dataclass
 from typing import Optional, Tuple
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit, urlparse
 
 import bleach
 import ebooklib
@@ -45,13 +47,21 @@ ALLOWED_PROTOCOLS = ["http", "https", "mailto"]
 
 
 def sanitize_html(raw_html: str) -> str:
-    return bleach.clean(
+    cleaned = bleach.clean(
         raw_html,
         tags=ALLOWED_TAGS,
         attributes=ALLOWED_ATTRS,
         protocols=ALLOWED_PROTOCOLS,
         strip=True,
     )
+    # Force-harden any links bleach let through: untrusted anchors that keep
+    # target="_blank" without rel="noopener noreferrer" enable reverse-tabnabbing.
+    soup = BeautifulSoup(cleaned, "html.parser")
+    for a in soup.find_all("a"):
+        a["rel"] = "noopener noreferrer nofollow"
+        if a.get("target") is None:
+            a["target"] = "_blank"
+    return str(soup)
 
 
 @dataclass
@@ -178,25 +188,11 @@ def to_plain_text_for_export(sanitized_content: str) -> str:
 # ---------------------------------------------------------------------------
 st.markdown(
     """
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <link rel="manifest" href="app/static/manifest.json">
-
-    <style>
-    .block-container {
-        padding-top: 1rem;
-        padding-bottom: 3rem;
-        padding-left: 0.85rem;
-        padding-right: 0.85rem;
-        max-width: 620px;
-    }
-    .meta-chip {
-        font-size: 0.82rem;
-        color: #888888;
-        margin-bottom: 0.75rem;
-    }
-    </style>
+    <meta name="theme-color" content="#1a1a1a">
     """,
     unsafe_allow_html=True,
 )
@@ -263,40 +259,35 @@ def extract_markdown(file_bytes: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Recipe Extractors (recipe-scrapers, JSON-LD Schema, & DOM Fallbacks)
+# Recipe Extraction
 # ---------------------------------------------------------------------------
 
 def extract_recipe_via_scraper(url: str, html_str: Optional[str] = None) -> Optional[str]:
     try:
-        if html_str:
-            scraper = scrape_me(url, html=html_str)
-        else:
-            scraper = scrape_me(url)
-
+        scraper = scrape_me(url, html=html_str) if html_str else scrape_me(url)
         title = scraper.title()
         ingredients = scraper.ingredients()
         instructions = scraper.instructions().split("\n")
         yields = scraper.yields()
         total_time = scraper.total_time()
 
-        out = [f"<h2>{html.escape(title)}</h2>"]
-
+        out = [f"<h1>{html.escape(title)}</h1>"]
         meta = []
         if yields:
             meta.append(f"Yield: {html.escape(yields)}")
         if total_time:
             meta.append(f"Total Time: {total_time} mins")
         if meta:
-            out.append(f"<p class='meta-chip'><em>{' | '.join(meta)}</em></p>")
+            out.append(f"<p><em>{' | '.join(meta)}</em></p>")
 
         if ingredients:
-            out.append("<h3>Ingredients</h3><ul>")
+            out.append("<h2>Ingredients</h2><ul>")
             for item in ingredients:
                 out.append(f"<li>{html.escape(item)}</li>")
             out.append("</ul>")
 
         if instructions:
-            out.append("<h3>Directions</h3><ol>")
+            out.append("<h2>Directions</h2><ol>")
             for step in instructions:
                 if step.strip():
                     out.append(f"<li>{html.escape(step.strip())}</li>")
@@ -334,18 +325,18 @@ def format_recipe_output(recipe: dict) -> str:
         elif isinstance(step, dict) and "text" in step:
             steps.append(step["text"])
 
-    out = [f"<h2>{html.escape(title)}</h2>"]
+    out = [f"<h1>{html.escape(title)}</h1>"]
     if description:
         out.append(f"<p><em>{html.escape(description)}</em></p>")
 
     if ingredients:
-        out.append("<h3>Ingredients</h3><ul>")
+        out.append("<h2>Ingredients</h2><ul>")
         for item in ingredients:
             out.append(f"<li>{html.escape(item)}</li>")
         out.append("</ul>")
 
     if steps:
-        out.append("<h3>Directions</h3><ol>")
+        out.append("<h2>Directions</h2><ol>")
         for step in steps:
             out.append(f"<li>{html.escape(step)}</li>")
         out.append("</ol>")
@@ -370,14 +361,13 @@ def find_recipe_section_by_anchor(raw_html: str) -> Optional[str]:
     target_id = target_id or anchor.get("data-target") or anchor.get("aria-controls")
 
     target = soup.find(id=target_id) if target_id else None
-
     if not target:
         target = soup.find(
             lambda tag: tag.get("id") and "recipe" in tag.get("id", "").lower()
         ) or soup.find(
             lambda tag: tag.get("class")
             and any(
-                any(marker in c.lower() for marker in ("recipe-card", "tasty-recipe", "wprm-recipe"))
+                any(m in c.lower() for m in ("recipe-card", "tasty-recipe", "wprm-recipe"))
                 for c in tag.get("class", [])
             )
         )
@@ -389,7 +379,72 @@ def find_recipe_section_by_anchor(raw_html: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Bypass Gateways (Wayback Machine & Jina Reader Engine)
+# Specialized Substack & Medium Resolvers
+# ---------------------------------------------------------------------------
+
+def is_substack_url(url: str, html_text: str = "") -> bool:
+    parsed = urlparse(url)
+    if "substack.com" in parsed.netloc:
+        return True
+    if any(marker in html_text for marker in ("substackcdn.com", "substack-custom-domains", "Substack")):
+        return True
+    return False
+
+
+def extract_substack(url: str) -> Optional[str]:
+    try:
+        parsed = urlparse(url)
+        path_parts = [p for p in parsed.path.split("/") if p]
+        if "p" in path_parts:
+            slug = path_parts[path_parts.index("p") + 1]
+            api_endpoint = f"{parsed.scheme}://{parsed.netloc}/api/v1/posts/{slug}"
+            resp = requests.get(
+                api_endpoint,
+                impersonate="chrome124",
+                timeout=12,
+                headers={"Accept": "application/json"},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                body_html = data.get("body_html", "")
+                title = data.get("title", "")
+                subtitle = data.get("subtitle", "")
+
+                header_html = f"<h1>{html.escape(title)}</h1>"
+                if subtitle:
+                    header_html += f"<p><em>{html.escape(subtitle)}</em></p>"
+
+                if body_html:
+                    return header_html + sanitize_html(body_html)
+    except Exception:
+        pass
+    return None
+
+
+def extract_medium(url: str) -> Optional[str]:
+    freedium_url = f"https://freedium.cfd/{url}"
+    try:
+        resp = requests.get(freedium_url, impersonate="chrome124", timeout=15)
+        if resp.status_code == 200 and len(resp.text) > 500:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            article = soup.find("article") or soup.find("main")
+            if article:
+                return sanitize_html(str(article))
+            body = trafilatura.extract(resp.text, favor_recall=True)
+            if body:
+                return format_plain_text(body)
+    except Exception:
+        pass
+
+    proxy_jina = fetch_jina_proxy(url)
+    if proxy_jina and len(proxy_jina) > 300:
+        return proxy_jina
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Fallback Gateways
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -407,7 +462,6 @@ def fetch_archive_org_snapshot(target_url: str) -> Optional[Tuple[str, str]]:
 
         raw_url = closest.get("url", "")
         timestamp = closest.get("timestamp", "")
-
         clean_snapshot_url = re.sub(r"/web/(\d{14})/", r"/web/\1id_/", raw_url)
         if "id_/" not in clean_snapshot_url:
             clean_snapshot_url = raw_url.replace(f"/web/{timestamp}/", f"/web/{timestamp}id_/")
@@ -433,20 +487,16 @@ def fetch_archive_org_snapshot(target_url: str) -> Optional[Tuple[str, str]]:
 def fetch_jina_proxy(target_url: str) -> str:
     proxy_url = f"https://r.jina.ai/{target_url}"
     try:
-        resp = requests.get(proxy_url, impersonate="chrome124", timeout=25)
+        resp = requests.get(proxy_url, impersonate="chrome124", timeout=20)
         if resp.status_code == 200 and resp.text.strip():
-            # Check that Jina didn't also capture a JS barrier
-            lower_text = resp.text.lower()
-            if "enable javascript" in lower_text or "javascript is required" in lower_text:
-                return ""
             return sanitize_html(markdown.markdown(resp.text))
     except Exception:
-        return ""
+        pass
     return ""
 
 
 # ---------------------------------------------------------------------------
-# Core URL Extractor Engine
+# Core URL Extractor
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -456,6 +506,16 @@ def extract_from_url(raw_input: str, prefer_wayback: bool = False) -> ExtractRes
         return ExtractResult(ok=False, message="Please enter a valid URL starting with http:// or https://")
 
     clean_url = match.group(1)
+
+    if is_substack_url(clean_url):
+        substack_content = extract_substack(clean_url)
+        if substack_content:
+            return ExtractResult(ok=True, content=substack_content)
+
+    if "medium.com" in clean_url or any(d in clean_url for d in ("towardsdatascience.com", "betterprogramming.pub")):
+        medium_content = extract_medium(clean_url)
+        if medium_content:
+            return ExtractResult(ok=True, content=medium_content)
 
     parts = urlsplit(clean_url)
     preserve_query_domains = ("share.google", "bit.ly", "onedrive.live.com", "1drv.ms")
@@ -472,76 +532,43 @@ def extract_from_url(raw_input: str, prefer_wayback: bool = False) -> ExtractRes
             arch_html, arch_date = archive_res
             recipe = extract_recipe_via_scraper(clean_url, html_str=arch_html)
             if recipe:
-                return ExtractResult(ok=True, content=f"<p class='meta-chip'>🏛️ Snapshot ({arch_date})</p>{recipe}")
+                return ExtractResult(ok=True, content=f"<p><em>🏛️ Snapshot ({arch_date})</em></p>{recipe}")
             body = trafilatura.extract(arch_html, favor_recall=True)
             if body:
-                return ExtractResult(ok=True, content=f"<p class='meta-chip'>🏛️ Snapshot ({arch_date})</p>{format_plain_text(body)}")
+                return ExtractResult(ok=True, content=f"<p><em>🏛️ Snapshot ({arch_date})</em></p>{format_plain_text(body)}")
 
     try:
-        resp = requests.get(
-            clean_url,
-            impersonate="chrome124",
-            timeout=15,
-            allow_redirects=True,
-        )
+        resp = requests.get(clean_url, impersonate="chrome124", timeout=15, allow_redirects=True)
         status = resp.status_code
         body_text = resp.text
     except SSLError:
-        return ExtractResult(
-            ok=False,
-            message="This site's TLS certificate could not be verified. Use the manual paste box below.",
-        )
+        return ExtractResult(ok=False, message="Site TLS error. Use the manual paste box below.")
     except Exception:
         status = 500
         body_text = ""
 
-    # Bot mitigation / IP wall / JS verification checks
-    anti_bot_patterns = [
-        "icanhazip.com",
-        "contentlicensing@people.inc",
-        "captcha-delivery.com",
-        "access denied",
-        "enable javascript",
-        "please enable javascript",
-        "turn javascript on",
-        "javascript is disabled",
-        "requires javascript",
-        "please turn on javascript",
-    ]
+    anti_bot = ["icanhazip.com", "contentlicensing@people.inc", "captcha-delivery.com", "access denied"]
+    is_blocked = status in (403, 429, 500) or any(pat in body_text.lower() for pat in anti_bot)
 
-    is_blocked = (
-        status in (403, 429, 500)
-        or any(pat in body_text.lower() for pat in anti_bot_patterns)
-    )
-
-    # If the page loaded without a firewall or JS barrier
     if not is_blocked and body_text:
-        content_type = resp.headers.get("content-type", "").lower()
-        content_disp = resp.headers.get("content-disposition", "").lower()
-        final_url = resp.url.lower()
+        if is_substack_url(clean_url, body_text):
+            substack_content = extract_substack(clean_url)
+            if substack_content:
+                return ExtractResult(ok=True, content=substack_content)
 
-        if "application/pdf" in content_type or final_url.endswith(".pdf") or ".pdf" in content_disp:
+        c_type = resp.headers.get("content-type", "").lower()
+        c_disp = resp.headers.get("content-disposition", "").lower()
+        f_url = resp.url.lower()
+
+        if "application/pdf" in c_type or f_url.endswith(".pdf") or ".pdf" in c_disp:
             return ExtractResult(ok=True, content=extract_pdf(resp.content))
-
-        if (
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document" in content_type
-            or final_url.endswith(".docx")
-            or ".docx" in content_disp
-        ):
+        if "application/vnd.openxmlformats-officedocument.wordprocessingml.document" in c_type or f_url.endswith(".docx") or ".docx" in c_disp:
             return ExtractResult(ok=True, content=extract_docx(resp.content))
-
-        if "application/epub+zip" in content_type or final_url.endswith(".epub") or ".epub" in content_disp:
+        if "application/epub+zip" in c_type or f_url.endswith(".epub") or ".epub" in c_disp:
             return ExtractResult(ok=True, content=extract_epub(resp.content))
-
-        if (
-            "application/rtf" in content_type
-            or "text/rtf" in content_type
-            or final_url.endswith(".rtf")
-            or ".rtf" in content_disp
-        ):
+        if "application/rtf" in c_type or "text/rtf" in c_type or f_url.endswith(".rtf") or ".rtf" in c_disp:
             return ExtractResult(ok=True, content=extract_rtf(resp.content))
-
-        if "text/plain" in content_type or final_url.endswith(".txt") or ".txt" in content_disp:
+        if "text/plain" in c_type or f_url.endswith(".txt") or ".txt" in c_disp:
             return ExtractResult(ok=True, content=format_plain_text(resp.text))
 
         recipe_scraped = extract_recipe_via_scraper(clean_url, html_str=body_text)
@@ -552,44 +579,36 @@ def extract_from_url(raw_input: str, prefer_wayback: bool = False) -> ExtractRes
         if recipe_data:
             return ExtractResult(ok=True, content=format_recipe_output(recipe_data))
 
-        recipe_section_html = find_recipe_section_by_anchor(body_text)
-        if recipe_section_html:
-            return ExtractResult(ok=True, content=sanitize_html(recipe_section_html))
+        recipe_section = find_recipe_section_by_anchor(body_text)
+        if recipe_section:
+            return ExtractResult(ok=True, content=sanitize_html(recipe_section))
 
-        body = trafilatura.extract(body_text, include_comments=False)
-        if not body:
-            body = trafilatura.extract(body_text, favor_recall=True)
-
-        if body and not any(p in body.lower() for p in ("enable javascript", "javascript is disabled")):
+        body = trafilatura.extract(body_text, include_comments=False) or trafilatura.extract(body_text, favor_recall=True)
+        if body:
             return ExtractResult(ok=True, content=format_plain_text(body))
 
-    # Fallback 1: Headless JS Reader (Jina AI chromium worker renders dynamic JS/SPAs)
-    proxy_content = fetch_jina_proxy(clean_url)
-    if proxy_content:
-        return ExtractResult(ok=True, content=proxy_content)
-
-    # Fallback 2: Internet Archive (Wayback Machine snapshot)
     archive_res = fetch_archive_org_snapshot(clean_url)
     if archive_res:
         arch_html, arch_date = archive_res
         recipe = extract_recipe_via_scraper(clean_url, html_str=arch_html)
         if recipe:
-            return ExtractResult(ok=True, content=f"<p class='meta-chip'>🏛️ Snapshot ({arch_date})</p>{recipe}")
+            return ExtractResult(ok=True, content=f"<p><em>🏛️ Snapshot ({arch_date})</em></p>{recipe}")
         recipe_data = extract_recipe_schema(arch_html)
         if recipe_data:
-            return ExtractResult(ok=True, content=f"<p class='meta-chip'>🏛️ Snapshot ({arch_date})</p>{format_recipe_output(recipe_data)}")
+            return ExtractResult(ok=True, content=f"<p><em>🏛️ Snapshot ({arch_date})</em></p>{format_recipe_output(recipe_data)}")
         body = trafilatura.extract(arch_html, favor_recall=True)
         if body:
-            return ExtractResult(ok=True, content=f"<p class='meta-chip'>🏛️ Snapshot ({arch_date})</p>{format_plain_text(body)}")
+            return ExtractResult(ok=True, content=f"<p><em>🏛️ Snapshot ({arch_date})</em></p>{format_plain_text(body)}")
 
-    return ExtractResult(
-        ok=False,
-        message="This page requires JavaScript or blocked access, and no working snapshot was found. Paste text into the box below.",
-    )
+    proxy_content = fetch_jina_proxy(clean_url)
+    if proxy_content:
+        return ExtractResult(ok=True, content=proxy_content)
+
+    return ExtractResult(ok=False, message="Firewalls blocked access and no archive found. Use manual paste below.")
 
 
 # ---------------------------------------------------------------------------
-# Display Engine: Sandboxed Frame with Native JS Toolbar
+# Reader Rendering
 # ---------------------------------------------------------------------------
 
 def render_reader(
@@ -600,159 +619,36 @@ def render_reader(
     theme_style: str,
     pane_height: int = 600,
 ):
-    tts_text_json = json.dumps(plain_text_for_tts)
+    template_path = os.path.join(os.path.dirname(__file__), "reader_view.html")
+    if os.path.exists(template_path):
+        with open(template_path, "r", encoding="utf-8") as f:
+            template = f.read()
+    else:
+        # Fallback inline if template is missing
+        template = (
+            "<div style='__THEME_STYLE__ font-family:__FONT_FAMILY__; "
+            "font-size:__FONT_SIZE__px; padding:16px; min-height:__PANE_HEIGHT__px;'>"
+            "__HTML_CONTENT__"
+            "<script>window.__TTS_TEXT__ = __TTS_TEXT_JSON__;</script>"
+            "</div>"
+        )
 
-    doc = f"""
-    <style>
-      html, body {{ margin: 0; padding: 0; height: 100%; font-family: -apple-system, sans-serif; }}
-      #progress-container {{
-          position: fixed; top: 0; left: 0; width: 100%; height: 6px;
-          background: rgba(128,128,128,0.2); z-index: 999;
-      }}
-      #progress-bar {{ width: 0%; height: 100%; background-color: #ff4b4b; transition: width 0.1s ease-out; }}
-      #toolbar {{
-          display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
-          padding: 8px 8px 6px 8px; background: #f2f2f2; border-bottom: 1px solid #ddd;
-          margin-top: 6px;
-      }}
-      .ctrl-btn, .speed-btn {{
-          border: 1px solid #ccc; background: #fff; color: #222;
-          border-radius: 999px; padding: 6px 12px; font-size: 13px; cursor: pointer;
-      }}
-      .speed-btn.active {{ background: #ff4b4b; color: #fff; border-color: #ff4b4b; }}
-      .speed-group {{ display: flex; gap: 4px; }}
-      #reader-scroll {{
-          height: {pane_height}px; overflow-y: auto; -webkit-overflow-scrolling: touch;
-          box-sizing: border-box;
-      }}
-      .reader-frame {{
-          font-family: {font_family}; font-size: {font_size}px; {theme_style}
-          padding: 1.25rem 1rem;
-      }}
-      .reader-frame p {{ margin-bottom: 1.35em; line-height: 1.8; }}
-      .meta-chip {{ font-size: 0.85rem; color: #888888; margin-bottom: 0.75rem; }}
-    </style>
-    <div id="progress-container"><div id="progress-bar"></div></div>
-    <div id="toolbar">
-      <button id="scrollToggleBtn" class="ctrl-btn">▶️ Start Scroll</button>
-      <span class="speed-group">
-        <button class="speed-btn" data-ms="70">Slow</button>
-        <button class="speed-btn active" data-ms="40">Medium</button>
-        <button class="speed-btn" data-ms="20">Fast</button>
-      </span>
-      <button id="ttsBtn" class="ctrl-btn">🔊 Read Aloud</button>
-    </div>
-    <div id="reader-scroll">
-      <div class="reader-frame">{html_content}</div>
-    </div>
-    <script>
-      (function() {{
-        const scrollEl = document.getElementById('reader-scroll');
-        const bar = document.getElementById('progress-bar');
-        const scrollToggleBtn = document.getElementById('scrollToggleBtn');
-        const ttsBtn = document.getElementById('ttsBtn');
-        const speedBtns = document.querySelectorAll('.speed-btn');
-
-        function updateProgress() {{
-          const total = scrollEl.scrollHeight - scrollEl.clientHeight;
-          if (total > 0) {{ bar.style.width = (scrollEl.scrollTop / total * 100) + '%'; }}
-        }}
-        scrollEl.addEventListener('scroll', updateProgress);
-        updateProgress();
-
-        let scrollTimer = null;
-        let scrollSpeedMs = 40;
-        let scrollActive = false;
-
-        function startScrolling() {{
-          if (scrollTimer) clearInterval(scrollTimer);
-          scrollTimer = setInterval(() => {{
-            scrollEl.scrollBy({{ top: 1, behavior: 'auto' }});
-          }}, scrollSpeedMs);
-        }}
-        function stopScrolling() {{
-          if (scrollTimer) {{ clearInterval(scrollTimer); scrollTimer = null; }}
-        }}
-
-        scrollToggleBtn.addEventListener('click', () => {{
-          scrollActive = !scrollActive;
-          if (scrollActive) {{
-            startScrolling();
-            scrollToggleBtn.textContent = '⏸ Pause Scroll';
-          }} else {{
-            stopScrolling();
-            scrollToggleBtn.textContent = '▶️ Start Scroll';
-          }}
-        }});
-
-        speedBtns.forEach(btn => {{
-          btn.addEventListener('click', () => {{
-            speedBtns.forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            scrollSpeedMs = parseInt(btn.dataset.ms, 10);
-            if (scrollActive) startScrolling();
-          }});
-        }});
-
-        const ttsFullText = {tts_text_json};
-        let ttsChunks = [];
-        let ttsIndex = 0;
-        let ttsSpeaking = false;
-
-        function chunkText(text) {{
-          const sentences = text.match(/[^.!?]+[.!?]*/g) || [text];
-          const chunks = [];
-          let current = "";
-          for (const s of sentences) {{
-            if ((current + s).length > 200 && current) {{
-              chunks.push(current.trim());
-              current = s;
-            }} else {{
-              current += s;
-            }}
-          }}
-          if (current.trim()) chunks.push(current.trim());
-          return chunks;
-        }}
-
-        function speakNext() {{
-          if (ttsIndex >= ttsChunks.length) {{
-            ttsSpeaking = false;
-            ttsBtn.textContent = '🔊 Read Aloud';
-            return;
-          }}
-          const utter = new SpeechSynthesisUtterance(ttsChunks[ttsIndex]);
-          utter.onend = () => {{ ttsIndex += 1; speakNext(); }};
-          window.speechSynthesis.speak(utter);
-        }}
-
-        ttsBtn.addEventListener('click', () => {{
-          if (!ttsSpeaking) {{
-            if (window.speechSynthesis.paused) {{
-              window.speechSynthesis.resume();
-            }} else {{
-              ttsChunks = chunkText(ttsFullText);
-              ttsIndex = 0;
-              window.speechSynthesis.cancel();
-              speakNext();
-            }}
-            ttsSpeaking = true;
-            ttsBtn.textContent = '⏸ Pause Reading';
-          }} else {{
-            window.speechSynthesis.pause();
-            ttsSpeaking = false;
-            ttsBtn.textContent = '▶️ Resume Reading';
-          }}
-        }});
-      }})();
-    </script>
-    """
+    doc = (
+        template
+        .replace("__PANE_HEIGHT__", str(pane_height))
+        .replace("__FONT_FAMILY__", font_family)
+        .replace("__FONT_SIZE__", str(font_size))
+        .replace("__THEME_STYLE__", theme_style)
+        .replace("__HTML_CONTENT__", html_content)
+        .replace("__TTS_TEXT_JSON__", json.dumps(plain_text_for_tts))
+    )
     components.html(doc, height=pane_height + 70, scrolling=False)
 
 
 # ---------------------------------------------------------------------------
 # UI Entrypoint
 # ---------------------------------------------------------------------------
+
 st.title("📖 Clean 9:16 Reader")
 
 if not sb:
@@ -763,14 +659,9 @@ selected_history_url = None
 
 if history_list:
     with st.expander("🕒 Recent URLs", expanded=False):
-        chosen = st.selectbox(
-            "Select a previously accessed page:",
-            options=["-- Select from history --"] + history_list,
-            index=0,
-        )
+        chosen = st.selectbox("Select a previously accessed page:", ["-- Select from history --"] + history_list, index=0)
         if chosen != "-- Select from history --":
             selected_history_url = chosen
-
         if st.button("🗑️ Clear History"):
             clear_history()
             st.rerun()
@@ -816,10 +707,7 @@ with col_ia_check:
     st.write("")
     use_wayback = st.checkbox("🏛️ Wayback", help="Force retrieval from Internet Archive snapshot")
 
-uploaded_file = st.file_uploader(
-    "Or upload document:",
-    type=["txt", "pdf", "docx", "epub", "rtf", "md"],
-)
+uploaded_file = st.file_uploader("Or upload document:", type=["txt", "pdf", "docx", "epub", "rtf", "md"])
 
 with st.expander("📋 Manual Text / Recipe Paste (Fallback)"):
     manual_text = st.text_area("Paste raw text or recipe directions here:", height=150)
@@ -872,14 +760,14 @@ if content:
     col_meta, col_copy = st.columns([3, 2])
     with col_meta:
         st.markdown(
-            f"<div class='meta-chip'>⏱️ ~{reading_time_min} min read &nbsp;•&nbsp; {word_count:,} words</div>",
+            f"<p style='opacity:0.7'>⏱️ ~{reading_time_min} min read  •  {word_count:,} words</p>",
             unsafe_allow_html=True,
         )
     with col_copy:
         with st.popover("📋 Copy Text"):
             st.code(raw_plain_text, language=None)
 
-    save_key = active_source_url or f"upload_{hash(content[:60])}"
+    save_key = active_source_url or f"upload_{hashlib.sha256(content.encode('utf-8')).hexdigest()[:16]}"
     if st.button("💾 Save to Supabase Library (read offline later)"):
         sanitized = sanitize_html(content)
         title = guess_title(sanitized, fallback=active_source_url or "Uploaded Document")
