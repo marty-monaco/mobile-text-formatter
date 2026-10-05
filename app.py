@@ -146,7 +146,9 @@ def save_to_library(url: str, title: str, content: str, word_count: int) -> bool
                 "word_count": word_count,
             }, on_conflict="url").execute()
             return True
-        except Exception:
+        except Exception as e:
+            # Log the actual error for debugging
+            st.error(f"Database error: {str(e)}")
             return False
     return False
 
