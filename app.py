@@ -164,6 +164,25 @@ def sign_out():
     for key in list(st.session_state.keys()):
         del st.session_state[key]
 
+def try_auto_login(client: Client) -> bool:
+    """If AUTO_LOGIN is on in secrets, sign in with the stored account so the
+    login screen is skipped. Returns True on success. On failure the normal
+    login form is shown, so you can't get locked out."""
+    if str(secret("AUTO_LOGIN", False)).lower() != "true":
+        return False
+    email = secret("APP_EMAIL")
+    password = secret("APP_PASSWORD")
+    if not email or not password:
+        return False
+    try:
+        res = client.auth.sign_in_with_password({"email": email, "password": password})
+    except Exception as e:
+        st.session_state["login_notice"] = f"Automatic sign-in failed: {e}"
+        return False
+    if res.session and res.user:
+        st.session_state["auth_user"] = {"id": res.user.id, "email": res.user.email}
+        return True
+    return False
 
 def render_login(client: Client):
     st.title("📖 Clean Reader")
