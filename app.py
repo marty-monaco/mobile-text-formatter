@@ -1126,7 +1126,7 @@ if client is None:
 else:
     c_user, c_out = st.columns([4, 1])
     c_user.caption(f"Signed in as {current_user()['email']}")
-        if str(secret("AUTO_LOGIN", False)).lower() != "true":
+    if str(secret("AUTO_LOGIN", False)).lower() != "true":
         c_out.button("Sign out", on_click=sign_out)
 
 # Share-sheet / bookmarklet launch:  https://YOUR-APP/?url=<URL-ENCODED LINK>
