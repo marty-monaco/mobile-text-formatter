@@ -8,10 +8,10 @@
       margin: 0;
       padding: 0;
       height: 100%;
+      position: relative;
       font-family: -apple-system, sans-serif;
     }
 
-    /* Fixed top scroll-progress indicator */
     #progress-container {
       position: fixed;
       top: 0;
@@ -28,16 +28,8 @@
       transition: width 0.1s ease-out;
     }
 
-    /* Action bar controls
-       IMPORTANT: nowrap + horizontal scroll instead of flex-wrap.
-       The outer iframe height is a fixed pixel value computed in Python
-       (pane_height + 70) that assumes a single-row toolbar. On narrow
-       mobile viewports flex-wrap pushed this onto 2-3 rows, which grew
-       taller than that budget; since the iframe has scrolling disabled
-       and nothing measures/reports real content height back to it,
-       anything past the fixed frame edge was simply invisible with no
-       way to reach it. Keeping the toolbar single-row and scrollable
-       sideways keeps its height constant on every screen size. */
+    /* Single-row toolbar that scrolls sideways. Never wrap it: the iframe
+       height is a fixed budget computed in Python (pane_height + 70). */
     #toolbar {
       display: flex;
       flex-wrap: nowrap;
@@ -73,7 +65,44 @@
       gap: 4px;
     }
 
-    /* Reader view scroll container */
+    /* Overlay panel: floats over the article so it never changes iframe height */
+    #settings-panel {
+      display: none;
+      position: absolute;
+      left: 8px;
+      right: 8px;
+      max-width: 420px;
+      box-sizing: border-box;
+      background: #ffffff;
+      color: #222;
+      border: 1px solid #ccc;
+      border-radius: 12px;
+      padding: 12px;
+      z-index: 5000;
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+    }
+    #settings-panel.open { display: block; }
+    #settings-panel label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      margin: 10px 0 4px 0;
+    }
+    #settings-panel label:first-child { margin-top: 0; }
+    #settings-panel select {
+      width: 100%;
+      font-size: 16px;
+      padding: 6px;
+      box-sizing: border-box;
+    }
+    #settings-panel input[type=range] { width: 100%; }
+    #sleepStatus {
+      font-size: 12px;
+      color: #777;
+      margin-top: 6px;
+      min-height: 14px;
+    }
+
     #reader-scroll {
       height: {{ pane_height }}px;
       overflow-y: auto;
@@ -90,11 +119,6 @@
       margin-bottom: 1.35em;
       line-height: 1.8;
     }
-    .meta-chip {
-      font-size: 0.85rem;
-      color: #888888;
-      margin-bottom: 0.75rem;
-    }
   </style>
 </head>
 <body>
@@ -110,6 +134,27 @@
       <button class="speed-btn" data-ms="20">Fast</button>
     </span>
     <button id="ttsBtn" class="ctrl-btn">🔊 Read Aloud</button>
+    <button id="settingsBtn" class="ctrl-btn">⚙️ Voice &amp; Timer</button>
+  </div>
+
+  <div id="settings-panel">
+    <label for="voiceSelect">Voice</label>
+    <select id="voiceSelect"></select>
+
+    <label for="rateRange">Speech speed: <span id="rateLabel">1.0×</span></label>
+    <input type="range" id="rateRange" min="0.6" max="1.8" step="0.1" value="1">
+
+    <label for="sleepSelect">Sleep timer (stops scrolling and reading)</label>
+    <select id="sleepSelect">
+      <option value="0">Off</option>
+      <option value="5">5 minutes</option>
+      <option value="10">10 minutes</option>
+      <option value="15">15 minutes</option>
+      <option value="30">30 minutes</option>
+      <option value="45">45 minutes</option>
+      <option value="60">60 minutes</option>
+    </select>
+    <div id="sleepStatus"></div>
   </div>
 
   <div id="reader-scroll">
@@ -119,14 +164,24 @@
   </div>
 
   <script>
-    (function() {
+    (function () {
       const scrollEl = document.getElementById('reader-scroll');
       const bar = document.getElementById('progress-bar');
+      const toolbar = document.getElementById('toolbar');
       const scrollToggleBtn = document.getElementById('scrollToggleBtn');
       const ttsBtn = document.getElementById('ttsBtn');
+      const settingsBtn = document.getElementById('settingsBtn');
+      const panel = document.getElementById('settings-panel');
+      const voiceSelect = document.getElementById('voiceSelect');
+      const rateRange = document.getElementById('rateRange');
+      const rateLabel = document.getElementById('rateLabel');
+      const sleepSelect = document.getElementById('sleepSelect');
+      const sleepStatus = document.getElementById('sleepStatus');
       const speedBtns = document.querySelectorAll('.speed-btn');
+      const SETTINGS_LABEL = '⚙️ Voice & Timer';
+      const synth = ('speechSynthesis' in window) ? window.speechSynthesis : null;
 
-      // Update progress bar as user or auto-scroller navigates
+      // ---------- Progress bar ----------
       function updateProgress() {
         const total = scrollEl.scrollHeight - scrollEl.clientHeight;
         if (total > 0) {
@@ -136,98 +191,264 @@
       scrollEl.addEventListener('scroll', updateProgress);
       updateProgress();
 
-      // Auto-scrolling state & controls
+      // ---------- Auto-scroll ----------
       let scrollTimer = null;
       let scrollSpeedMs = 40;
       let scrollActive = false;
 
       function startScrolling() {
         if (scrollTimer) clearInterval(scrollTimer);
-        scrollTimer = setInterval(() => {
+        scrollTimer = setInterval(function () {
           scrollEl.scrollBy({ top: 1, behavior: 'auto' });
         }, scrollSpeedMs);
       }
-
       function stopScrolling() {
         if (scrollTimer) {
           clearInterval(scrollTimer);
           scrollTimer = null;
         }
       }
-
-      scrollToggleBtn.addEventListener('click', () => {
-        scrollActive = !scrollActive;
-        if (scrollActive) {
+      function setScrollActive(active) {
+        scrollActive = active;
+        if (active) {
           startScrolling();
           scrollToggleBtn.textContent = '⏸ Pause Scroll';
         } else {
           stopScrolling();
           scrollToggleBtn.textContent = '▶️ Start Scroll';
         }
-      });
+      }
 
-      speedBtns.forEach(btn => {
-        btn.addEventListener('click', () => {
-          speedBtns.forEach(b => b.classList.remove('active'));
+      scrollToggleBtn.addEventListener('click', function () {
+        setScrollActive(!scrollActive);
+      });
+      speedBtns.forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          speedBtns.forEach(function (b) { b.classList.remove('active'); });
           btn.classList.add('active');
           scrollSpeedMs = parseInt(btn.dataset.ms, 10);
           if (scrollActive) startScrolling();
         });
       });
 
-      // Text-to-Speech (TTS) Chunking & Queue
+      // ---------- Read aloud ----------
       const ttsFullText = {{ tts_text_json }};
       let ttsChunks = [];
       let ttsIndex = 0;
-      let ttsSpeaking = false;
+      let ttsState = 'idle';   // idle | playing | paused
+      let ttsSession = 0;      // bumps on every start/pause so stale callbacks are ignored
 
-      function chunkText(text) {
-        const sentences = text.match(/[^.!?]+[.!?]*/g) || [text];
-        const chunks = [];
-        let current = "";
-        for (const s of sentences) {
-          if ((current + s).length > 200 && current) {
-            chunks.push(current.trim());
-            current = s;
-          } else {
-            current += s;
-          }
-        }
-        if (current.trim()) chunks.push(current.trim());
-        return chunks;
+      function setTtsUi() {
+        if (ttsState === 'playing') ttsBtn.textContent = '⏸ Pause Reading';
+        else if (ttsState === 'paused') ttsBtn.textContent = '▶️ Resume Reading';
+        else ttsBtn.textContent = '🔊 Read Aloud';
       }
 
-      function speakNext() {
+      function pushSplit(str, out) {
+        while (str.length > 220) {
+          let cut = str.lastIndexOf(' ', 220);
+          if (cut < 80) cut = 220;
+          out.push(str.slice(0, cut).trim());
+          str = str.slice(cut);
+        }
+        if (str.trim()) out.push(str.trim());
+      }
+
+      function chunkText(text) {
+        const out = [];
+        text.split(/\n+/).forEach(function (line) {
+          const sentences = line.match(/[^.!?]+[.!?]*/g) || [line];
+          let current = '';
+          sentences.forEach(function (s) {
+            if (current && (current + s).length > 200) {
+              pushSplit(current.trim(), out);
+              current = s;
+            } else {
+              current += s;
+            }
+          });
+          if (current.trim()) pushSplit(current.trim(), out);
+        });
+        return out.filter(function (c) { return c.length > 0; });
+      }
+
+      function selectedVoice() {
+        if (!synth) return null;
+        const voices = synth.getVoices();
+        return voices.find(function (v) { return v.voiceURI === voiceSelect.value; }) || null;
+      }
+
+      function speakNext(session) {
+        if (session !== ttsSession) return;
         if (ttsIndex >= ttsChunks.length) {
-          ttsSpeaking = false;
-          ttsBtn.textContent = '🔊 Read Aloud';
+          ttsState = 'idle';
+          ttsIndex = 0;
+          setTtsUi();
           return;
         }
         const utter = new SpeechSynthesisUtterance(ttsChunks[ttsIndex]);
-        utter.onend = () => {
+        const voice = selectedVoice();
+        if (voice) { utter.voice = voice; utter.lang = voice.lang; }
+        utter.rate = parseFloat(rateRange.value) || 1;
+        utter.onend = function () {
+          if (session !== ttsSession) return;
           ttsIndex += 1;
-          speakNext();
+          speakNext(session);
         };
-        window.speechSynthesis.speak(utter);
+        utter.onerror = function () {
+          if (session !== ttsSession) return;
+          ttsState = 'paused';
+          setTtsUi();
+        };
+        synth.speak(utter);
       }
 
-      ttsBtn.addEventListener('click', () => {
-        if (!ttsSpeaking) {
-          if (window.speechSynthesis.paused) {
-            window.speechSynthesis.resume();
-          } else {
-            ttsChunks = chunkText(ttsFullText);
-            ttsIndex = 0;
-            window.speechSynthesis.cancel();
-            speakNext();
-          }
-          ttsSpeaking = true;
-          ttsBtn.textContent = '⏸ Pause Reading';
+      function speakFrom(index) {
+        ttsSession += 1;
+        const session = ttsSession;
+        const wasBusy = synth.speaking || synth.pending;
+        if (wasBusy) synth.cancel();
+        ttsIndex = index;
+        // Start synchronously when idle (iOS wants speak() inside the tap);
+        // only delay when we had to cancel something first.
+        if (wasBusy) setTimeout(function () { speakNext(session); }, 60);
+        else speakNext(session);
+      }
+
+      function startTts() {
+        ttsChunks = chunkText(ttsFullText);
+        if (!ttsChunks.length) return;
+        ttsState = 'playing';
+        setTtsUi();
+        speakFrom(0);
+      }
+      function pauseTts() {
+        ttsSession += 1;
+        synth.cancel();
+        ttsState = 'paused';
+        setTtsUi();
+      }
+      function resumeTts() {
+        ttsState = 'playing';
+        setTtsUi();
+        speakFrom(ttsIndex);
+      }
+
+      if (!synth) {
+        ttsBtn.disabled = true;
+        ttsBtn.textContent = '🔇 Read aloud unavailable';
+        voiceSelect.disabled = true;
+        rateRange.disabled = true;
+      } else {
+        ttsBtn.addEventListener('click', function () {
+          if (ttsState === 'idle') startTts();
+          else if (ttsState === 'playing') pauseTts();
+          else resumeTts();
+        });
+      }
+
+      // ---------- Voice list ----------
+      function loadVoices() {
+        if (!synth) return;
+        const voices = synth.getVoices();
+        if (!voices.length) return;
+        const previous = voiceSelect.value;
+        const navLang = (navigator.language || 'en').toLowerCase().split('-')[0];
+        const sorted = voices.slice().sort(function (a, b) {
+          const am = a.lang.toLowerCase().indexOf(navLang) === 0 ? 0 : 1;
+          const bm = b.lang.toLowerCase().indexOf(navLang) === 0 ? 0 : 1;
+          return am - bm || a.name.localeCompare(b.name);
+        });
+        voiceSelect.innerHTML = '';
+        sorted.forEach(function (v) {
+          const opt = document.createElement('option');
+          opt.value = v.voiceURI;
+          opt.textContent = v.name + ' (' + v.lang + ')';
+          voiceSelect.appendChild(opt);
+        });
+        const stillThere = sorted.some(function (v) { return v.voiceURI === previous; });
+        if (previous && stillThere) {
+          voiceSelect.value = previous;
         } else {
-          window.speechSynthesis.pause();
-          ttsSpeaking = false;
-          ttsBtn.textContent = '▶️ Resume Reading';
+          const preferred = sorted.find(function (v) {
+            return v.default && v.lang.toLowerCase().indexOf(navLang) === 0;
+          }) || sorted[0];
+          voiceSelect.value = preferred.voiceURI;
         }
+      }
+      if (synth) {
+        loadVoices();
+        if (synth.onvoiceschanged !== undefined) synth.onvoiceschanged = loadVoices;
+        setTimeout(loadVoices, 500);   // some browsers never fire voiceschanged
+      }
+
+      function restartIfPlaying() {
+        if (synth && ttsState === 'playing') speakFrom(ttsIndex);
+      }
+      voiceSelect.addEventListener('change', restartIfPlaying);
+      rateRange.addEventListener('input', function () {
+        rateLabel.textContent = parseFloat(rateRange.value).toFixed(1) + '×';
+      });
+      rateRange.addEventListener('change', restartIfPlaying);
+
+      // ---------- Settings panel ----------
+      settingsBtn.addEventListener('click', function () {
+        if (!panel.classList.contains('open')) {
+          panel.style.top = (toolbar.offsetTop + toolbar.offsetHeight + 4) + 'px';
+        }
+        panel.classList.toggle('open');
+      });
+      scrollEl.addEventListener('pointerdown', function () {
+        panel.classList.remove('open');
+      });
+
+      // ---------- Sleep timer ----------
+      let sleepEndsAt = 0;
+      let sleepInterval = null;
+
+      function formatClock(ms) {
+        const total = Math.max(0, Math.round(ms / 1000));
+        const m = Math.floor(total / 60);
+        const s = total % 60;
+        return m + ':' + (s < 10 ? '0' : '') + s;
+      }
+
+      function stopEverything() {
+        setScrollActive(false);
+        if (synth && ttsState === 'playing') pauseTts();
+      }
+
+      function clearSleepTimer() {
+        if (sleepInterval) { clearInterval(sleepInterval); sleepInterval = null; }
+        sleepEndsAt = 0;
+        sleepSelect.value = '0';
+        sleepStatus.textContent = '';
+        settingsBtn.textContent = SETTINGS_LABEL;
+      }
+
+      function tickSleep() {
+        if (!sleepEndsAt) return;
+        const remaining = sleepEndsAt - Date.now();
+        if (remaining <= 0) {
+          stopEverything();
+          clearSleepTimer();
+          sleepStatus.textContent = 'Timer finished. Playback stopped.';
+          return;
+        }
+        sleepStatus.textContent = 'Stopping in ' + formatClock(remaining);
+        settingsBtn.textContent = '⏲ ' + formatClock(remaining);
+      }
+
+      sleepSelect.addEventListener('change', function () {
+        const minutes = parseInt(sleepSelect.value, 10);
+        if (sleepInterval) { clearInterval(sleepInterval); sleepInterval = null; }
+        if (!minutes) {
+          clearSleepTimer();
+          return;
+        }
+        sleepEndsAt = Date.now() + minutes * 60000;
+        sleepInterval = setInterval(tickSleep, 1000);
+        tickSleep();
       });
     })();
   </script>
