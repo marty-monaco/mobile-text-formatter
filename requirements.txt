@@ -11,3 +11,4 @@ extruct
 bleach
 supabase
 recipe-scrapers
+markdownify
