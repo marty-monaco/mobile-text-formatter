@@ -1104,12 +1104,16 @@ client = get_session_client()
 
 if client is not None:
     if current_user() is None:
-        render_login(client)
-        st.stop()
+        if not try_auto_login(client):
+            render_login(client)
+            st.stop()
     if get_db() is None:
         st.session_state.pop("auth_user", None)
-        st.session_state["login_notice"] = "Your session expired. Please sign in again."
-        st.rerun()
+        if try_auto_login(client):
+            st.rerun()
+        else:
+            st.session_state.setdefault("login_notice", "Your session expired. Please sign in again.")
+            st.rerun()
 
 st.title("📖 Clean 9:16 Reader")
 
@@ -1122,7 +1126,8 @@ if client is None:
 else:
     c_user, c_out = st.columns([4, 1])
     c_user.caption(f"Signed in as {current_user()['email']}")
-    c_out.button("Sign out", on_click=sign_out)
+        if str(secret("AUTO_LOGIN", False)).lower() != "true":
+        c_out.button("Sign out", on_click=sign_out)
 
 # Share-sheet / bookmarklet launch:  https://YOUR-APP/?url=<URL-ENCODED LINK>
 incoming_url = st.query_params.get("url")
