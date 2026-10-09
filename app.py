@@ -37,6 +37,7 @@ from pypdf import PdfReader
 from recipe_scrapers import scrape_me
 from striprtf.striprtf import rtf_to_text
 from supabase import Client, create_client
+from streamlit_cookies_controller import CookieController
 
 st.set_page_config(page_title="Clean Reader", page_icon="📖", layout="centered")
 
@@ -110,8 +111,12 @@ class ExtractResult:
 
 
 # ---------------------------------------------------------------------------
-# Supabase: per-session client + auth
+# Supabase: per-session client + auth (with "keep me signed in" cookie)
 # ---------------------------------------------------------------------------
+
+COOKIE_NAME = "clean_reader_rt"
+COOKIE_DAYS = 30
+
 
 def secret(name: str, default=None):
     try:
@@ -154,20 +159,80 @@ def get_db() -> Optional[Client]:
     return client
 
 
-def sign_out():
-    client = st.session_state.get("sb_client")
+def start_session(res, remember: bool):
+    """Record a successful sign-in."""
+    st.session_state["auth_user"] = {"id": res.user.id, "email": res.user.email}
+    st.session_state["remember_me"] = remember
+    st.session_state.pop("_logged_out", None)
+    st.session_state.pop("_db_fail", None)
+
+
+def sync_cookie(client: Client, cookies):
+    """Keep the cookie holding the newest refresh token. Supabase rotates
+    refresh tokens, so a stale cookie would stop working."""
+    if not st.session_state.get("remember_me"):
+        return
     try:
-        if client:
+        session = client.auth.get_session()
+    except Exception:
+        return
+    if session is None or not session.refresh_token:
+        return
+    if st.session_state.get("_cookie_rt") != session.refresh_token:
+        try:
+            cookies.set(
+                COOKIE_NAME,
+                session.refresh_token,
+                max_age=COOKIE_DAYS * 86400,
+                secure=True,
+                same_site="lax",
+            )
+            st.session_state["_cookie_rt"] = session.refresh_token
+        except Exception:
+            pass
+
+
+def try_restore_from_cookie(client: Client, cookies) -> str:
+    """Returns 'restored', 'none' (no cookie yet) or 'failed' (cookie rejected)."""
+    token = cookies.get(COOKIE_NAME)
+    if not token:
+        return "none"
+    try:
+        res = client.auth.refresh_session(token)
+    except Exception:
+        return "failed"
+    if res and res.session and res.user:
+        start_session(res, remember=True)
+        return "restored"
+    return "failed"
+
+
+def request_sign_out():
+    st.session_state["_do_sign_out"] = True
+
+
+def perform_sign_out(client: Client, cookies):
+    """Signs out this device only and forgets the cookie."""
+    try:
+        client.auth.sign_out({"scope": "local"})
+    except Exception:
+        try:
             client.auth.sign_out()
+        except Exception:
+            pass
+    try:
+        cookies.remove(COOKIE_NAME)
     except Exception:
         pass
     for key in list(st.session_state.keys()):
-        del st.session_state[key]
+        if key != "sb_client":
+            del st.session_state[key]
+    st.session_state["_logged_out"] = True
+
 
 def try_auto_login(client: Client) -> bool:
     """If AUTO_LOGIN is on in secrets, sign in with the stored account so the
-    login screen is skipped. Returns True on success. On failure the normal
-    login form is shown, so you can't get locked out."""
+    login screen is skipped. Returns True on success."""
     if str(secret("AUTO_LOGIN", False)).lower() != "true":
         return False
     email = secret("APP_EMAIL")
@@ -184,6 +249,7 @@ def try_auto_login(client: Client) -> bool:
         return True
     return False
 
+
 def render_login(client: Client):
     st.title("📖 Clean Reader")
     notice = st.session_state.pop("login_notice", None)
@@ -196,6 +262,7 @@ def render_login(client: Client):
     with st.form("login_form"):
         email = st.text_input("Email")
         password = st.text_input("Password", type="password")
+        remember = st.checkbox("Keep me signed in on this device", value=True)
         if allow_signup:
             c1, c2 = st.columns(2)
             do_sign_in = c1.form_submit_button("Sign in", use_container_width=True)
@@ -220,7 +287,7 @@ def render_login(client: Client):
         return
 
     if res.session and res.user:
-        st.session_state["auth_user"] = {"id": res.user.id, "email": res.user.email}
+        start_session(res, remember)
         st.rerun()
     else:
         st.info("Account created. Check your email to confirm it, then sign in.")
@@ -1101,19 +1168,48 @@ st.markdown(
 )
 
 client = get_session_client()
+cookies = CookieController() if client is not None else None
 
 if client is not None:
+    if st.session_state.pop("_do_sign_out", False):
+        perform_sign_out(client, cookies)
+
     if current_user() is None:
-        if not try_auto_login(client):
+        signed_in = try_auto_login(client)
+
+        if not signed_in and not st.session_state.get("_logged_out"):
+            outcome = try_restore_from_cookie(client, cookies)
+            if outcome == "restored":
+                signed_in = True
+            elif outcome == "failed":
+                try:
+                    cookies.remove(COOKIE_NAME)
+                except Exception:
+                    pass
+                st.session_state["login_notice"] = "Your saved sign-in expired. Please sign in again."
+            else:
+                # The cookie component loads a moment after the page does.
+                waits = st.session_state.get("_cookie_waits", 0)
+                if waits < 2:
+                    st.session_state["_cookie_waits"] = waits + 1
+                    st.caption("Loading…")
+                    time.sleep(0.6)
+                    st.rerun()
+
+        if not signed_in:
             render_login(client)
             st.stop()
+
     if get_db() is None:
+        fails = st.session_state.get("_db_fail", 0) + 1
         st.session_state.pop("auth_user", None)
-        if try_auto_login(client):
-            st.rerun()
-        else:
-            st.session_state.setdefault("login_notice", "Your session expired. Please sign in again.")
-            st.rerun()
+        st.session_state["_db_fail"] = fails
+        if fails > 2:
+            st.session_state["_logged_out"] = True
+        st.session_state.setdefault("login_notice", "Your session expired. Please sign in again.")
+        st.rerun()
+
+    sync_cookie(client, cookies)
 
 st.title("📖 Clean 9:16 Reader")
 
@@ -1127,7 +1223,7 @@ else:
     c_user, c_out = st.columns([4, 1])
     c_user.caption(f"Signed in as {current_user()['email']}")
     if str(secret("AUTO_LOGIN", False)).lower() != "true":
-        c_out.button("Sign out", on_click=sign_out)
+        c_out.button("Sign out", on_click=request_sign_out)
 
 # Share-sheet / bookmarklet launch:  https://YOUR-APP/?url=<URL-ENCODED LINK>
 incoming_url = st.query_params.get("url")
