@@ -12,3 +12,4 @@ bleach
 supabase
 recipe-scrapers
 markdownify
+streamlit-cookies-controller
