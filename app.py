@@ -97,6 +97,8 @@ EXTRACTION_METHODS = [
     "Jump-to-recipe section",
     "Article text",
     "Internet Archive snapshot",
+    "Archive.today mirror",        # <-- New
+    "Wikipedia clean article",     # <-- New
     "Jina reader proxy",
     "Substack API",
     "Medium mirror",
@@ -883,6 +885,81 @@ def extract_medium(url: str) -> Optional[str]:
         return proxy
     return None
 
+# ---------------------------------------------------------------------------
+# Wikipedia REST API Extractor
+# ---------------------------------------------------------------------------
+
+def is_wikipedia_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return "wikipedia.org" in parsed.netloc and "/wiki/" in parsed.path
+
+def extract_wikipedia(url: str) -> Optional[str]:
+    """Fetches clean mobile-first HTML directly from the official Wikipedia REST API."""
+    try:
+        parsed = urlparse(url)
+        lang = parsed.netloc.split(".")[0] if "." in parsed.netloc else "en"
+        title = parsed.path.split("/wiki/")[-1]
+        if not title:
+            return None
+
+        api_url = f"https://{lang}.wikipedia.org/api/rest_v1/page/html/{title}"
+        resp = requests.get(
+            api_url,
+            impersonate="chrome124",
+            timeout=12,
+            headers={"User-Agent": "CleanReader/1.0 (cleanreader@example.com)"},
+        )
+        if resp.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Strip Wikipedia-specific navigation and citation clutter
+        for selector in [
+            "table.sidebar", "table.infobox", ".mw-ref", ".navbox",
+            ".noprint", "link", "style", ".mw-empty-elt"
+        ]:
+            for tag in soup.select(selector):
+                tag.decompose()
+
+        # Fix relative image/link paths to full Wikipedia links
+        for a in soup.find_all("a", href=True):
+            if a["href"].startswith("./"):
+                a["href"] = f"https://{lang}.wikipedia.org/wiki/{a['href'][2:]}"
+
+        return sanitize_html(str(soup))
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Archive.today / Archive.ph Extractor
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_archive_today(target_url: str) -> Optional[str]:
+    """Queries Archive.today/Archive.is for paywalled or hard-blocked articles."""
+    gateways = ["https://archive.is/latest/", "https://archive.ph/latest/"]
+    for base in gateways:
+        try:
+            resp = requests.get(
+                f"{base}{target_url}",
+                impersonate="chrome124",
+                timeout=15,
+                allow_redirects=True,
+            )
+            if resp.status_code == 200 and len(resp.text.strip()) > 1000:
+                # Discard Archive.is banner/toolbar if present
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for bar in soup.find_all(id=re.compile(r"header|toolbar|wm-ipp", re.I)):
+                    bar.decompose()
+
+                body = trafilatura.extract(str(soup), favor_recall=True)
+                if body:
+                    return f"<p><em>🏛️ Archive.today Snapshot</em></p>{format_plain_text(body)}"
+        except Exception:
+            continue
+    return None
 
 # ---------------------------------------------------------------------------
 # Fallback gateways
@@ -965,6 +1042,10 @@ def run_forced_method(method: str, original_url: str, clean_url: str) -> Extract
         content = extract_substack(original_url)
     elif method == "Medium mirror":
         content = extract_medium(original_url)
+    elif method == "Wikipedia clean article":
+        content = extract_wikipedia(original_url)
+    elif method == "Archive.today mirror":
+        content = fetch_archive_today(clean_url)
     elif method == "Jina reader proxy":
         content = fetch_jina_proxy(clean_url) or None
     elif method == "Internet Archive snapshot":
@@ -975,6 +1056,7 @@ def run_forced_method(method: str, original_url: str, clean_url: str) -> Extract
             if found:
                 content = f"<p><em>🏛️ Snapshot ({arch_date})</em></p>{found[0]}"
     else:
+        # Existing fallback branches (live HTML, recipes, article text)...
         page_html = fetch_live_html(clean_url)
         if not page_html:
             return ExtractResult(
@@ -1012,11 +1094,29 @@ def extract_from_url(raw_input: str, method: str = AUTO_METHOD) -> ExtractResult
     if method != AUTO_METHOD:
         return run_forced_method(method, original_url, clean_url)
 
-    # ---- Automatic chain ----
+   # ---- Automatic chain ----
+    if is_wikipedia_url(original_url):
+        content = extract_wikipedia(original_url)
+        if content:
+            return ExtractResult(ok=True, content=content, method_used="Wikipedia REST API")
+
     if is_substack_url(original_url):
         content = extract_substack(original_url)
         if content:
             return ExtractResult(ok=True, content=content, method_used="Substack API")
+
+        # In your fallback sequence (after Internet Archive fails):
+    archive_today_content = fetch_archive_today(clean_url)
+    if archive_today_content:
+        return ExtractResult(ok=True, content=archive_today_content, method_used="Archive.today snapshot")
+
+    proxy_content = fetch_jina_proxy(clean_url)
+    if proxy_content:
+        return ExtractResult(ok=True, content=proxy_content, method_used="Jina reader proxy")
+
+    proxy_content = fetch_jina_proxy(clean_url)
+    if proxy_content:
+        return ExtractResult(ok=True, content=proxy_content, method_used="Jina reader proxy")
 
     if "medium.com" in original_url or any(
         d in original_url for d in ("towardsdatascience.com", "betterprogramming.pub")
