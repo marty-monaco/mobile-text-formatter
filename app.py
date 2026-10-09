@@ -15,6 +15,7 @@ import html
 import io
 import json
 import re
+import time  # <--- Add this import
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
