@@ -16,6 +16,7 @@ import io
 import json
 import re
 import time  # <--- Add this import
+from supabase.client import ClientOptions
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -137,7 +138,11 @@ def get_session_client() -> Optional[Client]:
         return None
     if "sb_client" not in st.session_state:
         try:
-            st.session_state["sb_client"] = create_client(url, key)
+            st.session_state["sb_client"] = create_client(
+                url,
+                key,
+                options=ClientOptions(auto_refresh_token=False, persist_session=False),
+            )
         except Exception:
             return None
     return st.session_state["sb_client"]
@@ -196,14 +201,18 @@ def sync_cookie(client: Client, cookies):
 
 
 def try_restore_from_cookie(client: Client, cookies) -> str:
-    """Returns 'restored', 'none' (no cookie yet) or 'failed' (cookie rejected)."""
+    """Returns 'restored', 'none' (no cookie yet), 'failed' (token rejected)
+    or 'error' (temporary problem; keep the cookie)."""
     token = cookies.get(COOKIE_NAME)
     if not token:
         return "none"
     try:
         res = client.auth.refresh_session(token)
-    except Exception:
-        return "failed"
+    except Exception as e:
+        status = getattr(e, "status", None)
+        # A 4xx from Supabase means the token itself was rejected.
+        # Network errors, timeouts, 5xx and 429 are treated as temporary.
+        return "failed" if status in (400, 401, 403, 422) else "error"
     if res and res.session and res.user:
         start_session(res, remember=True)
         return "restored"
@@ -1291,7 +1300,7 @@ if client is not None:
             else:
                 # The cookie component loads a moment after the page does.
                 waits = st.session_state.get("_cookie_waits", 0)
-                if waits < 2:
+                if waits < 4:
                     st.session_state["_cookie_waits"] = waits + 1
                     st.caption("Loading…")
                     time.sleep(0.6)
