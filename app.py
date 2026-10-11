@@ -3,7 +3,8 @@ Clean Reader — mobile-friendly reader for articles, recipes and documents.
 
 - Supabase email/password login, per-user library + history (row-level security)
 - One Supabase client PER browser session (never shared across users)
-- Selectable extraction method, Internet Archive / Substack / Medium recovery
+- "Keep me signed in" cookie with refresh-token rotation handling
+- Selectable extraction method, Internet Archive / Archive.today / Substack / Medium recovery
 - Recipe serving scaler
 - Export: .txt, .md, .html, .epub
 - Share-sheet launch via  ?url=<encoded link>
@@ -15,8 +16,7 @@ import html
 import io
 import json
 import re
-import time  # <--- Add this import
-from supabase.client import ClientOptions
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -38,8 +38,13 @@ from markdownify import markdownify as html_to_markdown
 from pypdf import PdfReader
 from recipe_scrapers import scrape_me
 from striprtf.striprtf import rtf_to_text
-from supabase import Client, create_client
 from streamlit_cookies_controller import CookieController
+from supabase import Client, create_client
+
+try:
+    from supabase.client import ClientOptions
+except ImportError:  # older/newer supabase versions
+    ClientOptions = None
 
 st.set_page_config(page_title="Clean Reader", page_icon="📖", layout="centered")
 
@@ -98,8 +103,8 @@ EXTRACTION_METHODS = [
     "Jump-to-recipe section",
     "Article text",
     "Internet Archive snapshot",
-    "Archive.today mirror",        # <-- New
-    "Wikipedia clean article",     # <-- New
+    "Archive.today mirror",
+    "Wikipedia clean article",
     "Jina reader proxy",
     "Substack API",
     "Medium mirror",
@@ -131,18 +136,25 @@ def secret(name: str, default=None):
 
 def get_session_client() -> Optional[Client]:
     """One client per browser session. Do NOT cache this with cache_resource:
-    a shared client would share one user's login with every other visitor."""
+    a shared client would share one user's login with every other visitor.
+
+    Background auto-refresh is disabled on purpose. Supabase refresh tokens are
+    single-use, so a leftover client from an earlier browser session refreshing
+    on its own timer would burn the token held in the cookie and sign you out.
+    Refreshing only happens in get_db() during a live script run, and
+    sync_cookie() then stores the new token."""
     url = secret("SUPABASE_URL")
     key = secret("SUPABASE_KEY")
     if not url or not key:
         return None
     if "sb_client" not in st.session_state:
         try:
-            st.session_state["sb_client"] = create_client(
-                url,
-                key,
-                options=ClientOptions(auto_refresh_token=False, persist_session=False),
-            )
+            if ClientOptions is not None:
+                st.session_state["sb_client"] = create_client(
+                    url, key, options=ClientOptions(auto_refresh_token=False)
+                )
+            else:
+                st.session_state["sb_client"] = create_client(url, key)
         except Exception:
             return None
     return st.session_state["sb_client"]
@@ -201,8 +213,12 @@ def sync_cookie(client: Client, cookies):
 
 
 def try_restore_from_cookie(client: Client, cookies) -> str:
-    """Returns 'restored', 'none' (no cookie yet), 'failed' (token rejected)
-    or 'error' (temporary problem; keep the cookie)."""
+    """Returns:
+    'restored' - signed in from the cookie
+    'none'     - no cookie (yet)
+    'failed'   - Supabase rejected the token (really expired or already used)
+    'error'    - temporary problem (network, 5xx, rate limit); keep the cookie
+    """
     token = cookies.get(COOKIE_NAME)
     if not token:
         return "none"
@@ -211,7 +227,6 @@ def try_restore_from_cookie(client: Client, cookies) -> str:
     except Exception as e:
         status = getattr(e, "status", None)
         # A 4xx from Supabase means the token itself was rejected.
-        # Network errors, timeouts, 5xx and 429 are treated as temporary.
         return "failed" if status in (400, 401, 403, 422) else "error"
     if res and res.session and res.user:
         start_session(res, remember=True)
@@ -894,13 +909,15 @@ def extract_medium(url: str) -> Optional[str]:
         return proxy
     return None
 
+
 # ---------------------------------------------------------------------------
-# Wikipedia REST API Extractor
+# Wikipedia REST API extractor
 # ---------------------------------------------------------------------------
 
 def is_wikipedia_url(url: str) -> bool:
     parsed = urlparse(url)
     return "wikipedia.org" in parsed.netloc and "/wiki/" in parsed.path
+
 
 def extract_wikipedia(url: str) -> Optional[str]:
     """Fetches clean mobile-first HTML directly from the official Wikipedia REST API."""
@@ -926,12 +943,12 @@ def extract_wikipedia(url: str) -> Optional[str]:
         # Strip Wikipedia-specific navigation and citation clutter
         for selector in [
             "table.sidebar", "table.infobox", ".mw-ref", ".navbox",
-            ".noprint", "link", "style", ".mw-empty-elt"
+            ".noprint", "link", "style", ".mw-empty-elt",
         ]:
             for tag in soup.select(selector):
                 tag.decompose()
 
-        # Fix relative image/link paths to full Wikipedia links
+        # Fix relative links to full Wikipedia links
         for a in soup.find_all("a", href=True):
             if a["href"].startswith("./"):
                 a["href"] = f"https://{lang}.wikipedia.org/wiki/{a['href'][2:]}"
@@ -942,7 +959,7 @@ def extract_wikipedia(url: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Archive.today / Archive.ph Extractor
+# Archive.today extractor
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -969,6 +986,7 @@ def fetch_archive_today(target_url: str) -> Optional[str]:
         except Exception:
             continue
     return None
+
 
 # ---------------------------------------------------------------------------
 # Fallback gateways
@@ -1065,7 +1083,7 @@ def run_forced_method(method: str, original_url: str, clean_url: str) -> Extract
             if found:
                 content = f"<p><em>🏛️ Snapshot ({arch_date})</em></p>{found[0]}"
     else:
-        # Existing fallback branches (live HTML, recipes, article text)...
+        # Methods that work from the live page (recipes, article text)
         page_html = fetch_live_html(clean_url)
         if not page_html:
             return ExtractResult(
@@ -1103,7 +1121,8 @@ def extract_from_url(raw_input: str, method: str = AUTO_METHOD) -> ExtractResult
     if method != AUTO_METHOD:
         return run_forced_method(method, original_url, clean_url)
 
-   # ---- Automatic chain ----
+    # ---- Automatic chain ----
+    # 1. Site-specific handlers
     if is_wikipedia_url(original_url):
         content = extract_wikipedia(original_url)
         if content:
@@ -1114,19 +1133,6 @@ def extract_from_url(raw_input: str, method: str = AUTO_METHOD) -> ExtractResult
         if content:
             return ExtractResult(ok=True, content=content, method_used="Substack API")
 
-        # In your fallback sequence (after Internet Archive fails):
-    archive_today_content = fetch_archive_today(clean_url)
-    if archive_today_content:
-        return ExtractResult(ok=True, content=archive_today_content, method_used="Archive.today snapshot")
-
-    proxy_content = fetch_jina_proxy(clean_url)
-    if proxy_content:
-        return ExtractResult(ok=True, content=proxy_content, method_used="Jina reader proxy")
-
-    proxy_content = fetch_jina_proxy(clean_url)
-    if proxy_content:
-        return ExtractResult(ok=True, content=proxy_content, method_used="Jina reader proxy")
-
     if "medium.com" in original_url or any(
         d in original_url for d in ("towardsdatascience.com", "betterprogramming.pub")
     ):
@@ -1134,6 +1140,7 @@ def extract_from_url(raw_input: str, method: str = AUTO_METHOD) -> ExtractResult
         if content:
             return ExtractResult(ok=True, content=content, method_used="Medium mirror")
 
+    # 2. Live page
     status, body_text, resp = 500, "", None
     try:
         resp = requests.get(clean_url, impersonate="chrome124", timeout=15, allow_redirects=True)
@@ -1174,6 +1181,7 @@ def extract_from_url(raw_input: str, method: str = AUTO_METHOD) -> ExtractResult
         if found:
             return ExtractResult(ok=True, content=found[0], method_used=found[1])
 
+    # 3. Fallbacks: only reached if the live page failed, was blocked, or gave nothing usable
     snapshot = fetch_archive_org_snapshot(clean_url)
     if snapshot:
         arch_html, arch_date = snapshot
@@ -1184,6 +1192,10 @@ def extract_from_url(raw_input: str, method: str = AUTO_METHOD) -> ExtractResult
                 content=f"<p><em>🏛️ Snapshot ({arch_date})</em></p>{found[0]}",
                 method_used=f"Internet Archive snapshot → {found[1]}",
             )
+
+    archive_today_content = fetch_archive_today(clean_url)
+    if archive_today_content:
+        return ExtractResult(ok=True, content=archive_today_content, method_used="Archive.today snapshot")
 
     proxy_content = fetch_jina_proxy(clean_url)
     if proxy_content:
@@ -1297,6 +1309,11 @@ if client is not None:
                 except Exception:
                     pass
                 st.session_state["login_notice"] = "Your saved sign-in expired. Please sign in again."
+            elif outcome == "error":
+                st.session_state["login_notice"] = (
+                    "Couldn't reach the sign-in service. Reload to try again; "
+                    "your saved sign-in has been kept."
+                )
             else:
                 # The cookie component loads a moment after the page does.
                 waits = st.session_state.get("_cookie_waits", 0)
@@ -1384,6 +1401,7 @@ with st.expander("🛠️ Not looking right? Try another method"):
         extract_from_url.clear()
         fetch_jina_proxy.clear()
         fetch_archive_org_snapshot.clear()
+        fetch_archive_today.clear()
         st.rerun()
 
 uploaded_file = st.file_uploader(
