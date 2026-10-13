@@ -664,4 +664,4 @@ def render_reader(
         .replace("{{ content }}", html_content)
         .replace("__HTML_CONTENT__", html_content)
         .replace("{{ tts_text_json }}", tts_json)
-        .replace("__TTS_TEXT_JSON__", tts_json
+        .replace("__TTS_TEXT_JSON__", tts_json)
