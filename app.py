@@ -237,4 +237,23 @@ def format_plain_text(raw_text: str) -> str:
         if not lines:
             continue
 
-        is_short_form = any(len(l) <
+        is_short_form = any(len(l) <def format_plain_text(raw_text: str) -> str:
+    text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    blocks = re.split(r"\n\s*\n+", text)
+    clean_paragraphs = []
+
+    for block in blocks:
+        lines = [l.strip() for l in block.split("\n") if l.strip()]
+        if not lines:
+            continue
+
+        # Complete the generator expression and close the parenthesis:
+        is_short_form = any(len(l) < 35 for l in lines)
+        if is_short_form and len(lines) > 1:
+            joined = "<br>".join(html.escape(l) for l in lines)
+        else:
+            joined = html.escape(" ".join(lines))
+
+        clean_paragraphs.append(f"<p>{joined}</p>")
+
+    return "".join(clean_paragraphs)
