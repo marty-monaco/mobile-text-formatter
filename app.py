@@ -10,7 +10,7 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Optional, Tuple
-from urllib.parse import urlsplit, urlunsplit, urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import bleach
 import ebooklib
@@ -628,7 +628,7 @@ def extract_from_url(raw_input: str, prefer_wayback: bool = False) -> ExtractRes
 
 
 # ---------------------------------------------------------------------------
-# Reader Rendering
+# Reader Rendering with Offline Subway Persistence
 # ---------------------------------------------------------------------------
 
 def render_reader(
@@ -644,7 +644,186 @@ def render_reader(
         with open(template_path, "r", encoding="utf-8") as f:
             template = f.read()
     else:
-        template = "<div class='reader-frame'>{{ content }}</div>"
+        # Fallback inline reader featuring offline local cache restoration
+        template = """
+        <style>
+          html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, sans-serif; }
+          #progress-container {
+              position: fixed; top: 0; left: 0; width: 100%; height: 6px;
+              background: rgba(128,128,128,0.2); z-index: 999;
+          }
+          #progress-bar { width: 0%; height: 100%; background-color: #ff4b4b; transition: width 0.1s ease-out; }
+          #toolbar {
+              display: flex; flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch;
+              align-items: center; gap: 6px; padding: 8px 8px 6px 8px; background: #f2f2f2;
+              border-bottom: 1px solid #ddd; margin-top: 6px;
+          }
+          .ctrl-btn, .speed-btn {
+              flex-shrink: 0; border: 1px solid #ccc; background: #fff; color: #222;
+              border-radius: 999px; padding: 6px 12px; font-size: 13px; cursor: pointer; white-space: nowrap;
+          }
+          .speed-btn.active { background: #ff4b4b; color: #fff; border-color: #ff4b4b; }
+          .speed-group { display: flex; flex-shrink: 0; gap: 4px; }
+          #reader-scroll {
+              height: __PANE_HEIGHT__px; overflow-y: auto; -webkit-overflow-scrolling: touch;
+              box-sizing: border-box;
+          }
+          .reader-frame {
+              font-family: __FONT_FAMILY__; font-size: __FONT_SIZE__px; __THEME_STYLE__
+              padding: 1.25rem 1rem;
+          }
+          .reader-frame p { margin-bottom: 1.35em; line-height: 1.8; }
+        </style>
+        <div id="progress-container"><div id="progress-bar"></div></div>
+        <div id="toolbar">
+          <button id="offlineRestoreBtn" class="ctrl-btn" style="display:none; background:#ff4b4b; color:#fff; border-color:#ff4b4b;">🚇 Restore Subway Cache</button>
+          <button id="scrollToggleBtn" class="ctrl-btn">▶️ Start Scroll</button>
+          <span class="speed-group">
+            <button class="speed-btn" data-ms="70">Slow</button>
+            <button class="speed-btn active" data-ms="40">Medium</button>
+            <button class="speed-btn" data-ms="20">Fast</button>
+          </span>
+          <button id="ttsBtn" class="ctrl-btn">🔊 Read Aloud</button>
+        </div>
+        <div id="reader-scroll">
+          <div class="reader-frame">__HTML_CONTENT__</div>
+        </div>
+        <script>
+          (function() {
+            const scrollEl = document.getElementById('reader-scroll');
+            const readerFrame = document.querySelector('.reader-frame');
+            const bar = document.getElementById('progress-bar');
+            const scrollToggleBtn = document.getElementById('scrollToggleBtn');
+            const offlineRestoreBtn = document.getElementById('offlineRestoreBtn');
+            const ttsBtn = document.getElementById('ttsBtn');
+            const speedBtns = document.querySelectorAll('.speed-btn');
+
+            const CACHE_KEY = 'subway_cached_article';
+            const SCROLL_KEY = 'subway_scroll_top';
+
+            try {
+              const currentHtml = readerFrame ? readerFrame.innerHTML.trim() : '';
+              if (currentHtml && currentHtml.length > 50 && !currentHtml.includes('__HTML_CONTENT__')) {
+                localStorage.setItem(CACHE_KEY, currentHtml);
+              } else {
+                const cached = localStorage.getItem(CACHE_KEY);
+                if (cached && offlineRestoreBtn) offlineRestoreBtn.style.display = 'inline-block';
+              }
+              const savedScroll = localStorage.getItem(SCROLL_KEY);
+              if (savedScroll && scrollEl) scrollEl.scrollTop = parseInt(savedScroll, 10);
+            } catch(e) {
+              console.warn('Storage quota or private mode', e);
+            }
+
+            if (offlineRestoreBtn) {
+              offlineRestoreBtn.addEventListener('click', function() {
+                const cached = localStorage.getItem(CACHE_KEY);
+                if (cached && readerFrame) {
+                  readerFrame.innerHTML = cached;
+                  updateProgress();
+                  offlineRestoreBtn.style.display = 'none';
+                }
+              });
+            }
+
+            function updateProgress() {
+              const total = scrollEl.scrollHeight - scrollEl.clientHeight;
+              if (total > 0) { bar.style.width = (scrollEl.scrollTop / total * 100) + '%'; }
+            }
+            scrollEl.addEventListener('scroll', function() {
+              updateProgress();
+              try { localStorage.setItem(SCROLL_KEY, scrollEl.scrollTop); } catch(e) {}
+            });
+            updateProgress();
+
+            let scrollTimer = null;
+            let scrollSpeedMs = 40;
+            let scrollActive = false;
+
+            function startScrolling() {
+              if (scrollTimer) clearInterval(scrollTimer);
+              scrollTimer = setInterval(() => {
+                scrollEl.scrollBy({ top: 1, behavior: 'auto' });
+              }, scrollSpeedMs);
+            }
+            function stopScrolling() {
+              if (scrollTimer) { clearInterval(scrollTimer); scrollTimer = null; }
+            }
+
+            scrollToggleBtn.addEventListener('click', () => {
+              scrollActive = !scrollActive;
+              if (scrollActive) {
+                startScrolling();
+                scrollToggleBtn.textContent = '⏸ Pause Scroll';
+              } else {
+                stopScrolling();
+                scrollToggleBtn.textContent = '▶️ Start Scroll';
+              }
+            });
+
+            speedBtns.forEach(btn => {
+              btn.addEventListener('click', () => {
+                speedBtns.forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                scrollSpeedMs = parseInt(btn.dataset.ms, 10);
+                if (scrollActive) startScrolling();
+              });
+            });
+
+            const ttsFullText = __TTS_TEXT_JSON__;
+            let ttsChunks = [];
+            let ttsIndex = 0;
+            let ttsSpeaking = false;
+
+            function chunkText(text) {
+              const sentences = text.match(/[^.!?]+[.!?]*/g) || [text];
+              const chunks = [];
+              let current = "";
+              for (const s of sentences) {
+                if ((current + s).length > 200 && current) {
+                  chunks.push(current.trim());
+                  current = s;
+                } else {
+                  current += s;
+                }
+              }
+              if (current.trim()) chunks.push(current.trim());
+              return chunks;
+            }
+
+            function speakNext() {
+              if (ttsIndex >= ttsChunks.length) {
+                ttsSpeaking = false;
+                ttsBtn.textContent = '🔊 Read Aloud';
+                return;
+              }
+              const utter = new SpeechSynthesisUtterance(ttsChunks[ttsIndex]);
+              utter.onend = () => { ttsIndex += 1; speakNext(); };
+              window.speechSynthesis.speak(utter);
+            }
+
+            ttsBtn.addEventListener('click', () => {
+              if (!('speechSynthesis' in window)) return;
+              if (!ttsSpeaking) {
+                if (window.speechSynthesis.paused) {
+                  window.speechSynthesis.resume();
+                } else {
+                  ttsChunks = chunkText(ttsFullText);
+                  ttsIndex = 0;
+                  window.speechSynthesis.cancel();
+                  speakNext();
+                }
+                ttsSpeaking = true;
+                ttsBtn.textContent = '⏸ Pause Reading';
+              } else {
+                window.speechSynthesis.pause();
+                ttsSpeaking = false;
+                ttsBtn.textContent = '▶️ Resume Reading';
+              }
+            });
+          })();
+        </script>
+        """
 
     tts_json = json_for_script(plain_text_for_tts)
 
