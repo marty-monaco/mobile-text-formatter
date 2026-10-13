@@ -28,8 +28,6 @@
       transition: width 0.1s ease-out;
     }
 
-    /* Single-row toolbar that scrolls sideways. Never wrap it: the iframe
-       height is a fixed budget computed in Python (pane_height + 70). */
     #toolbar {
       display: flex;
       flex-wrap: nowrap;
@@ -65,7 +63,6 @@
       gap: 4px;
     }
 
-    /* Overlay panel: floats over the article so it never changes iframe height */
     #settings-panel {
       display: none;
       position: absolute;
@@ -127,6 +124,7 @@
   </div>
 
   <div id="toolbar">
+    <button id="offlineRestoreBtn" class="ctrl-btn" style="display:none; background:#ff4b4b; color:#fff; border-color:#ff4b4b;">🚇 Restore Cache</button>
     <button id="scrollToggleBtn" class="ctrl-btn">▶️ Start Scroll</button>
     <span class="speed-group">
       <button class="speed-btn" data-ms="70">Slow</button>
@@ -166,11 +164,13 @@
   <script>
     (function () {
       const scrollEl = document.getElementById('reader-scroll');
+      const readerFrame = document.querySelector('.reader-frame');
       const bar = document.getElementById('progress-bar');
       const toolbar = document.getElementById('toolbar');
       const scrollToggleBtn = document.getElementById('scrollToggleBtn');
       const ttsBtn = document.getElementById('ttsBtn');
       const settingsBtn = document.getElementById('settingsBtn');
+      const offlineRestoreBtn = document.getElementById('offlineRestoreBtn');
       const panel = document.getElementById('settings-panel');
       const voiceSelect = document.getElementById('voiceSelect');
       const rateRange = document.getElementById('rateRange');
@@ -181,14 +181,55 @@
       const SETTINGS_LABEL = '⚙️ Voice & Timer';
       const synth = ('speechSynthesis' in window) ? window.speechSynthesis : null;
 
-      // ---------- Progress bar ----------
+      // ---------- Phone Storage & Subway Persistence ----------
+      const CACHE_KEY = 'subway_cached_article';
+      const SCROLL_KEY = 'subway_scroll_top';
+
+      try {
+        const currentHtml = readerFrame ? readerFrame.innerHTML.trim() : '';
+        // If content loaded from server, cache it to phone memory
+        if (currentHtml && currentHtml.length > 50 && !currentHtml.includes('{{ content }}')) {
+          localStorage.setItem(CACHE_KEY, currentHtml);
+        } else {
+          // If server delivered blank content (e.g. reload offline), check storage
+          const cached = localStorage.getItem(CACHE_KEY);
+          if (cached) {
+            offlineRestoreBtn.style.display = 'inline-block';
+          }
+        }
+
+        // Restore scroll position
+        const savedScroll = localStorage.getItem(SCROLL_KEY);
+        if (savedScroll && scrollEl) {
+          scrollEl.scrollTop = parseInt(savedScroll, 10);
+        }
+      } catch (err) {
+        console.warn('Storage quota or private browsing restriction:', err);
+      }
+
+      offlineRestoreBtn.addEventListener('click', function () {
+        const cached = localStorage.getItem(CACHE_KEY);
+        if (cached && readerFrame) {
+          readerFrame.innerHTML = cached;
+          updateProgress();
+          offlineRestoreBtn.style.display = 'none';
+        }
+      });
+
+      // ---------- Progress bar & Scroll tracking ----------
       function updateProgress() {
         const total = scrollEl.scrollHeight - scrollEl.clientHeight;
         if (total > 0) {
           bar.style.width = (scrollEl.scrollTop / total * 100) + '%';
         }
       }
-      scrollEl.addEventListener('scroll', updateProgress);
+
+      scrollEl.addEventListener('scroll', function () {
+        updateProgress();
+        try {
+          localStorage.setItem(SCROLL_KEY, scrollEl.scrollTop);
+        } catch (e) {}
+      });
       updateProgress();
 
       // ---------- Auto-scroll ----------
@@ -235,8 +276,8 @@
       const ttsFullText = {{ tts_text_json }};
       let ttsChunks = [];
       let ttsIndex = 0;
-      let ttsState = 'idle';   // idle | playing | paused
-      let ttsSession = 0;      // bumps on every start/pause so stale callbacks are ignored
+      let ttsState = 'idle';
+      let ttsSession = 0;
 
       function setTtsUi() {
         if (ttsState === 'playing') ttsBtn.textContent = '⏸ Pause Reading';
@@ -309,8 +350,6 @@
         const wasBusy = synth.speaking || synth.pending;
         if (wasBusy) synth.cancel();
         ttsIndex = index;
-        // Start synchronously when idle (iOS wants speak() inside the tap);
-        // only delay when we had to cancel something first.
         if (wasBusy) setTimeout(function () { speakNext(session); }, 60);
         else speakNext(session);
       }
@@ -379,7 +418,7 @@
       if (synth) {
         loadVoices();
         if (synth.onvoiceschanged !== undefined) synth.onvoiceschanged = loadVoices;
-        setTimeout(loadVoices, 500);   // some browsers never fire voiceschanged
+        setTimeout(loadVoices, 500);
       }
 
       function restartIfPlaying() {
