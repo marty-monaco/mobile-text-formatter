@@ -219,7 +219,8 @@ st.markdown(
 
 
 def decode_bytes(data: bytes) -> str:
-    for enc in ("utf-8", "latin-1", "iso-8859-1", "cp1252"):
+    # Try cp1252/windows-1252 before raw fallback to prevent mojibake ()
+    for enc in ("utf-8", "cp1252", "latin-1", "iso-8859-1"):
         try:
             return data.decode(enc)
         except UnicodeDecodeError:
@@ -250,7 +251,10 @@ def format_plain_text(raw_text: str) -> str:
 
 def extract_pdf(file_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(file_bytes))
-    return format_plain_text("\n\n".join(p.extract_text() or "" for p in reader.pages))
+    extracted = "\n\n".join(p.extract_text() or "" for p in reader.pages)
+    if not extracted.strip():
+        return "<p><em>⚠️ This PDF appears to be a scanned image or empty. Native text extraction could not detect any readable text.</em></p>"
+    return format_plain_text(extracted)
 
 
 def extract_docx(file_bytes: bytes) -> str:
@@ -559,6 +563,9 @@ def extract_from_url(raw_input: str, prefer_wayback: bool = False) -> ExtractRes
 
     try:
         resp = requests.get(clean_url, impersonate="chrome124", timeout=15, allow_redirects=True)
+        # Prevent mojibake () on legacy archives using Windows-1252 / ISO-8859-1
+        if resp.encoding is None or resp.encoding.lower() in ("iso-8859-1", "utf-8"):
+            resp.encoding = resp.apparent_encoding or "windows-1252"
         status = resp.status_code
         body_text = resp.text
     except SSLError:
@@ -644,7 +651,7 @@ def render_reader(
         with open(template_path, "r", encoding="utf-8") as f:
             template = f.read()
     else:
-        # Fallback inline reader featuring offline local cache restoration
+        # Standalone resilient reader with native auto-scroll, TTS, & local subway caching
         template = """
         <style>
           html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, sans-serif; }
@@ -895,7 +902,7 @@ if library_items:
                 delete_from_library(art_id)
                 st.rerun()
 
-col_input, col_ia_check = st.columns([3, 1])
+col_input, col_ia_check, col_clear = st.columns([3, 1, 0.8])
 with col_input:
     url_input = st.text_input(
         "Paste URL (Article, Recipe, OneDrive, PDF, or text):",
@@ -906,6 +913,13 @@ with col_ia_check:
     st.write("")
     st.write("")
     use_wayback = st.checkbox("🏛️ Wayback", help="Force retrieval from Internet Archive snapshot")
+with col_clear:
+    st.write("")
+    st.write("")
+    if st.button("🔄 Cache", help="Flush cached pages and re-fetch"):
+        st.cache_data.clear()
+        st.toast("Cache flushed!", icon="🧹")
+        st.rerun()
 
 uploaded_file = st.file_uploader("Or upload document:", type=["txt", "pdf", "docx", "epub", "rtf", "md"])
 
