@@ -1,15 +1,18 @@
 """
 Clean Reader — mobile-friendly text/recipe/article reader with Supabase persistence,
-Internet Archive recovery, dedicated Medium/Substack extraction, and offline subway cache.
+Internet Archive recovery, dedicated Medium/Substack extraction, recipe scaling,
+chapter navigation, and offline subway cache.
 """
 
 import html
 import io
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from fractions import Fraction
+from typing import List, Optional, Tuple
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import bleach
@@ -38,7 +41,13 @@ ALLOWED_TAGS = [
     "thead", "tbody", "tr", "th", "td",
 ]
 ALLOWED_ATTRS = {
-    "a": ["href", "title", "rel", "target"],
+    "a": ["href", "title", "rel", "target", "id"],
+    "h1": ["id"],
+    "h2": ["id"],
+    "h3": ["id"],
+    "h4": ["id"],
+    "span": ["class", "id"],
+    "div": ["class", "id"],
     "img": ["src", "alt", "title"],
     "*": ["class"],
 }
@@ -55,6 +64,11 @@ def sanitize_html(raw_html: str) -> str:
     )
     soup = BeautifulSoup(cleaned, "html.parser")
     for a in soup.find_all("a"):
+        href = a.get("href", "")
+        # Preserve internal section anchor links
+        if href.startswith("#"):
+            a["target"] = "_self"
+            continue
         a["rel"] = "noopener noreferrer nofollow"
         if a.get("target") is None:
             a["target"] = "_blank"
@@ -219,7 +233,6 @@ st.markdown(
 
 
 def decode_bytes(data: bytes) -> str:
-    # Try cp1252/windows-1252 before raw fallback to prevent mojibake ()
     for enc in ("utf-8", "cp1252", "latin-1", "iso-8859-1"):
         try:
             return data.decode(enc)
@@ -280,6 +293,121 @@ def extract_epub(file_bytes: bytes) -> str:
 
 def extract_markdown(file_bytes: bytes) -> str:
     return sanitize_html(markdown.markdown(decode_bytes(file_bytes)))
+
+
+# ---------------------------------------------------------------------------
+# Recipe Scaling Engine
+# ---------------------------------------------------------------------------
+
+UNICODE_FRACTIONS = {
+    "½": 0.5, "⅓": 1/3, "⅔": 2/3, "¼": 0.25, "¾": 0.75,
+    "⅕": 0.2, "⅖": 0.4, "⅗": 0.6, "⅘": 0.8,
+    "⅙": 1/6, "⅚": 5/6, "⅛": 0.125, "⅜": 0.375, "⅝": 0.625, "⅞": 0.875,
+}
+
+def parse_amount(val_str: str) -> float:
+    val_str = val_str.strip()
+    for char, val in UNICODE_FRACTIONS.items():
+        if char in val_str:
+            prefix = val_str.replace(char, "").strip()
+            base = float(prefix) if prefix else 0.0
+            return base + val
+    if "/" in val_str:
+        parts = val_str.split()
+        if len(parts) == 2:
+            return float(parts[0]) + float(Fraction(parts[1]))
+        return float(Fraction(val_str))
+    return float(val_str)
+
+
+def format_amount(amount: float) -> str:
+    if amount <= 0:
+        return ""
+    whole = math.floor(amount)
+    frac = round((amount - whole) * 8) / 8  # round to nearest eighth
+    frac_map = {
+        0.125: "⅛", 0.25: "¼", 0.375: "⅜", 0.5: "½",
+        0.625: "⅝", 0.75: "¾", 0.875: "⅞",
+    }
+    frac_str = frac_map.get(round(frac, 3), "")
+
+    if whole > 0 and frac_str:
+        return f"{whole} {frac_str}"
+    if frac_str:
+        return frac_str
+    if whole > 0 and frac == 0:
+        return str(whole)
+    return f"{amount:.2f}".rstrip("0").rstrip(".")
+
+
+def scale_ingredient_line(text: str, multiplier: float) -> str:
+    if multiplier == 1.0:
+        return text
+    fr_chars = "".join(UNICODE_FRACTIONS.keys())
+    pattern = rf"^(\d+\s+\d+/\d+|\d+/\d+|\d+(?:\.\d+)?\s*[{fr_chars}]|\d+(?:\.\d+)?|[{fr_chars}])\s*(.*)$"
+    match = re.match(pattern, text.strip())
+    if not match:
+        return text
+    qty_str, rest = match.groups()
+    try:
+        scaled = parse_amount(qty_str) * multiplier
+        return f"{format_amount(scaled)} {rest}".strip()
+    except Exception:
+        return text
+
+
+def scale_recipe_html(content_html: str, multiplier: float) -> str:
+    if multiplier == 1.0:
+        return content_html
+    soup = BeautifulSoup(content_html, "html.parser")
+    # Identify ingredient sections (list items inside an ingredients block)
+    for ul in soup.find_all(["ul", "ol"]):
+        prev_heading = ul.find_previous(["h2", "h3", "h4", "p", "strong"])
+        if prev_heading and "ingredient" in prev_heading.get_text().lower():
+            for li in ul.find_all("li"):
+                li.string = scale_ingredient_line(li.get_text(strip=True), multiplier)
+    return str(soup)
+
+
+# ---------------------------------------------------------------------------
+# Chapter & Section Navigation Engine
+# ---------------------------------------------------------------------------
+
+def inject_chapter_anchors(content_html: str) -> Tuple[str, List[Tuple[str, str, int]]]:
+    """Injects unique IDs into headings and returns a list of (id, title, level)."""
+    soup = BeautifulSoup(content_html, "html.parser")
+    headings = soup.find_all(["h1", "h2", "h3"])
+    toc: List[Tuple[str, str, int]] = []
+
+    for i, h in enumerate(headings, 1):
+        text = h.get_text(strip=True)
+        if not text or len(text) < 2:
+            continue
+        anchor_id = f"section-{i}"
+        h["id"] = anchor_id
+        level = int(h.name[1])
+        toc.append((anchor_id, text, level))
+
+    return str(soup), toc
+
+
+def build_toc_html(toc: List[Tuple[str, str, int]]) -> str:
+    if len(toc) < 2:
+        return ""
+    items = []
+    for anchor_id, title, level in toc:
+        indent = "12px" if level == 2 else ("24px" if level >= 3 else "0px")
+        items.append(
+            f"<li style='margin-left:{indent}; margin-bottom:6px; list-style:none;'>"
+            f"<a href='#{anchor_id}' style='text-decoration:none; color:inherit; opacity:0.85;'>• {html.escape(title)}</a>"
+            f"</li>"
+        )
+    return (
+        f"<details style='margin-bottom:1.2rem; padding:8px 12px; background:rgba(128,128,128,0.08); border-radius:8px; font-size:0.92rem;'>"
+        f"<summary style='cursor:pointer; font-weight:600;'>📑 Table of Contents ({len(toc)} sections)</summary>"
+        f"<ul style='margin-top:10px; padding-left:4px;'>{''.join(items)}</ul>"
+        f"</details>"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -563,7 +691,6 @@ def extract_from_url(raw_input: str, prefer_wayback: bool = False) -> ExtractRes
 
     try:
         resp = requests.get(clean_url, impersonate="chrome124", timeout=15, allow_redirects=True)
-        # Prevent mojibake () on legacy archives using Windows-1252 / ISO-8859-1
         if resp.encoding is None or resp.encoding.lower() in ("iso-8859-1", "utf-8"):
             resp.encoding = resp.apparent_encoding or "windows-1252"
         status = resp.status_code
@@ -646,378 +773,189 @@ def render_reader(
     theme_style: str,
     pane_height: int = 600,
 ):
-    template_path = os.path.join(os.path.dirname(__file__), "reader_view.html")
-    if os.path.exists(template_path):
-        with open(template_path, "r", encoding="utf-8") as f:
-            template = f.read()
-    else:
-        # Standalone resilient reader with native auto-scroll, TTS, & local subway caching
-        template = """
-        <style>
-          html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, sans-serif; }
-          #progress-container {
-              position: fixed; top: 0; left: 0; width: 100%; height: 6px;
-              background: rgba(128,128,128,0.2); z-index: 999;
-          }
-          #progress-bar { width: 0%; height: 100%; background-color: #ff4b4b; transition: width 0.1s ease-out; }
-          #toolbar {
-              display: flex; flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch;
-              align-items: center; gap: 6px; padding: 8px 8px 6px 8px; background: #f2f2f2;
-              border-bottom: 1px solid #ddd; margin-top: 6px;
-          }
-          .ctrl-btn, .speed-btn {
-              flex-shrink: 0; border: 1px solid #ccc; background: #fff; color: #222;
-              border-radius: 999px; padding: 6px 12px; font-size: 13px; cursor: pointer; white-space: nowrap;
-          }
-          .speed-btn.active { background: #ff4b4b; color: #fff; border-color: #ff4b4b; }
-          .speed-group { display: flex; flex-shrink: 0; gap: 4px; }
-          #reader-scroll {
-              height: __PANE_HEIGHT__px; overflow-y: auto; -webkit-overflow-scrolling: touch;
-              box-sizing: border-box;
-          }
-          .reader-frame {
-              font-family: __FONT_FAMILY__; font-size: __FONT_SIZE__px; __THEME_STYLE__
-              padding: 1.25rem 1rem;
-          }
-          .reader-frame p { margin-bottom: 1.35em; line-height: 1.8; }
-        </style>
-        <div id="progress-container"><div id="progress-bar"></div></div>
-        <div id="toolbar">
-          <button id="offlineRestoreBtn" class="ctrl-btn" style="display:none; background:#ff4b4b; color:#fff; border-color:#ff4b4b;">🚇 Restore Subway Cache</button>
-          <button id="scrollToggleBtn" class="ctrl-btn">▶️ Start Scroll</button>
-          <span class="speed-group">
-            <button class="speed-btn" data-ms="70">Slow</button>
-            <button class="speed-btn active" data-ms="40">Medium</button>
-            <button class="speed-btn" data-ms="20">Fast</button>
-          </span>
-          <button id="ttsBtn" class="ctrl-btn">🔊 Read Aloud</button>
-        </div>
-        <div id="reader-scroll">
-          <div class="reader-frame">__HTML_CONTENT__</div>
-        </div>
-        <script>
-          (function() {
-            const scrollEl = document.getElementById('reader-scroll');
-            const readerFrame = document.querySelector('.reader-frame');
-            const bar = document.getElementById('progress-bar');
-            const scrollToggleBtn = document.getElementById('scrollToggleBtn');
-            const offlineRestoreBtn = document.getElementById('offlineRestoreBtn');
-            const ttsBtn = document.getElementById('ttsBtn');
-            const speedBtns = document.querySelectorAll('.speed-btn');
+    template = """
+    <style>
+      html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, sans-serif; }
+      #progress-container {
+          position: fixed; top: 0; left: 0; width: 100%; height: 6px;
+          background: rgba(128,128,128,0.2); z-index: 999;
+      }
+      #progress-bar { width: 0%; height: 100%; background-color: #ff4b4b; transition: width 0.1s ease-out; }
+      #toolbar {
+          display: flex; flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch;
+          align-items: center; gap: 6px; padding: 8px 8px 6px 8px; background: #f2f2f2;
+          border-bottom: 1px solid #ddd; margin-top: 6px;
+      }
+      .ctrl-btn, .speed-btn {
+          flex-shrink: 0; border: 1px solid #ccc; background: #fff; color: #222;
+          border-radius: 999px; padding: 6px 12px; font-size: 13px; cursor: pointer; white-space: nowrap;
+      }
+      .speed-btn.active { background: #ff4b4b; color: #fff; border-color: #ff4b4b; }
+      .speed-group { display: flex; flex-shrink: 0; gap: 4px; }
+      #reader-scroll {
+          height: __PANE_HEIGHT__px; overflow-y: auto; -webkit-overflow-scrolling: touch;
+          box-sizing: border-box; scroll-behavior: smooth;
+      }
+      .reader-frame {
+          font-family: __FONT_FAMILY__; font-size: __FONT_SIZE__px; __THEME_STYLE__
+          padding: 1.25rem 1rem;
+      }
+      .reader-frame p { margin-bottom: 1.35em; line-height: 1.8; }
+    </style>
+    <div id="progress-container"><div id="progress-bar"></div></div>
+    <div id="toolbar">
+      <button id="offlineRestoreBtn" class="ctrl-btn" style="display:none; background:#ff4b4b; color:#fff; border-color:#ff4b4b;">🚇 Restore Subway Cache</button>
+      <button id="scrollToggleBtn" class="ctrl-btn">▶️ Start Scroll</button>
+      <span class="speed-group">
+        <button class="speed-btn" data-ms="70">Slow</button>
+        <button class="speed-btn active" data-ms="40">Medium</button>
+        <button class="speed-btn" data-ms="20">Fast</button>
+      </span>
+      <button id="ttsBtn" class="ctrl-btn">🔊 Read Aloud</button>
+    </div>
+    <div id="reader-scroll">
+      <div class="reader-frame">__HTML_CONTENT__</div>
+    </div>
+    <script>
+      (function() {
+        const scrollEl = document.getElementById('reader-scroll');
+        const readerFrame = document.querySelector('.reader-frame');
+        const bar = document.getElementById('progress-bar');
+        const scrollToggleBtn = document.getElementById('scrollToggleBtn');
+        const offlineRestoreBtn = document.getElementById('offlineRestoreBtn');
+        const ttsBtn = document.getElementById('ttsBtn');
+        const speedBtns = document.querySelectorAll('.speed-btn');
 
-            const CACHE_KEY = 'subway_cached_article';
-            const SCROLL_KEY = 'subway_scroll_top';
+        const CACHE_KEY = 'subway_cached_article';
+        const SCROLL_KEY = 'subway_scroll_top';
 
-            try {
-              const currentHtml = readerFrame ? readerFrame.innerHTML.trim() : '';
-              if (currentHtml && currentHtml.length > 50 && !currentHtml.includes('__HTML_CONTENT__')) {
-                localStorage.setItem(CACHE_KEY, currentHtml);
-              } else {
-                const cached = localStorage.getItem(CACHE_KEY);
-                if (cached && offlineRestoreBtn) offlineRestoreBtn.style.display = 'inline-block';
-              }
-              const savedScroll = localStorage.getItem(SCROLL_KEY);
-              if (savedScroll && scrollEl) scrollEl.scrollTop = parseInt(savedScroll, 10);
-            } catch(e) {
-              console.warn('Storage quota or private mode', e);
-            }
+        try {
+          const currentHtml = readerFrame ? readerFrame.innerHTML.trim() : '';
+          if (currentHtml && currentHtml.length > 50 && !currentHtml.includes('__HTML_CONTENT__')) {
+            localStorage.setItem(CACHE_KEY, currentHtml);
+          } else {
+            const cached = localStorage.getItem(CACHE_KEY);
+            if (cached && offlineRestoreBtn) offlineRestoreBtn.style.display = 'inline-block';
+          }
+          const savedScroll = localStorage.getItem(SCROLL_KEY);
+          if (savedScroll && scrollEl) scrollEl.scrollTop = parseInt(savedScroll, 10);
+        } catch(e) {
+          console.warn('Storage quota or private mode', e);
+        }
 
-            if (offlineRestoreBtn) {
-              offlineRestoreBtn.addEventListener('click', function() {
-                const cached = localStorage.getItem(CACHE_KEY);
-                if (cached && readerFrame) {
-                  readerFrame.innerHTML = cached;
-                  updateProgress();
-                  offlineRestoreBtn.style.display = 'none';
-                }
-              });
-            }
-
-            function updateProgress() {
-              const total = scrollEl.scrollHeight - scrollEl.clientHeight;
-              if (total > 0) { bar.style.width = (scrollEl.scrollTop / total * 100) + '%'; }
-            }
-            scrollEl.addEventListener('scroll', function() {
+        if (offlineRestoreBtn) {
+          offlineRestoreBtn.addEventListener('click', function() {
+            const cached = localStorage.getItem(CACHE_KEY);
+            if (cached && readerFrame) {
+              readerFrame.innerHTML = cached;
               updateProgress();
-              try { localStorage.setItem(SCROLL_KEY, scrollEl.scrollTop); } catch(e) {}
-            });
-            updateProgress();
-
-            let scrollTimer = null;
-            let scrollSpeedMs = 40;
-            let scrollActive = false;
-
-            function startScrolling() {
-              if (scrollTimer) clearInterval(scrollTimer);
-              scrollTimer = setInterval(() => {
-                scrollEl.scrollBy({ top: 1, behavior: 'auto' });
-              }, scrollSpeedMs);
+              offlineRestoreBtn.style.display = 'none';
             }
-            function stopScrolling() {
-              if (scrollTimer) { clearInterval(scrollTimer); scrollTimer = null; }
+          });
+        }
+
+        function updateProgress() {
+          const total = scrollEl.scrollHeight - scrollEl.clientHeight;
+          if (total > 0) { bar.style.width = (scrollEl.scrollTop / total * 100) + '%'; }
+        }
+        scrollEl.addEventListener('scroll', function() {
+          updateProgress();
+          try { localStorage.setItem(SCROLL_KEY, scrollEl.scrollTop); } catch(e) {}
+        });
+        updateProgress();
+
+        let scrollTimer = null;
+        let scrollSpeedMs = 40;
+        let scrollActive = false;
+
+        function startScrolling() {
+          if (scrollTimer) clearInterval(scrollTimer);
+          scrollTimer = setInterval(() => {
+            scrollEl.scrollBy({ top: 1, behavior: 'auto' });
+          }, scrollSpeedMs);
+        }
+        function stopScrolling() {
+          if (scrollTimer) { clearInterval(scrollTimer); scrollTimer = null; }
+        }
+
+        scrollToggleBtn.addEventListener('click', () => {
+          scrollActive = !scrollActive;
+          if (scrollActive) {
+            startScrolling();
+            scrollToggleBtn.textContent = '⏸ Pause Scroll';
+          } else {
+            stopScrolling();
+            scrollToggleBtn.textContent = '▶️ Start Scroll';
+          }
+        });
+
+        speedBtns.forEach(btn => {
+          btn.addEventListener('click', () => {
+            speedBtns.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            scrollSpeedMs = parseInt(btn.dataset.ms, 10);
+            if (scrollActive) startScrolling();
+          });
+        });
+
+        const ttsFullText = __TTS_TEXT_JSON__;
+        let ttsChunks = [];
+        let ttsIndex = 0;
+        let ttsSpeaking = false;
+
+        function chunkText(text) {
+          const sentences = text.match(/[^.!?]+[.!?]*/g) || [text];
+          const chunks = [];
+          let current = "";
+          for (const s of sentences) {
+            if ((current + s).length > 200 && current) {
+              chunks.push(current.trim());
+              current = s;
+            } else {
+              current += s;
             }
+          }
+          if (current.trim()) chunks.push(current.trim());
+          return chunks;
+        }
 
-            scrollToggleBtn.addEventListener('click', () => {
-              scrollActive = !scrollActive;
-              if (scrollActive) {
-                startScrolling();
-                scrollToggleBtn.textContent = '⏸ Pause Scroll';
-              } else {
-                stopScrolling();
-                scrollToggleBtn.textContent = '▶️ Start Scroll';
-              }
-            });
+        function speakNext() {
+          if (ttsIndex >= ttsChunks.length) {
+            ttsSpeaking = false;
+            ttsBtn.textContent = '🔊 Read Aloud';
+            return;
+          }
+          const utter = new SpeechSynthesisUtterance(ttsChunks[ttsIndex]);
+          utter.onend = () => { ttsIndex += 1; speakNext(); };
+          window.speechSynthesis.speak(utter);
+        }
 
-            speedBtns.forEach(btn => {
-              btn.addEventListener('click', () => {
-                speedBtns.forEach(b => b.classList.remove('active'));
-                btn.classList.add('active');
-                scrollSpeedMs = parseInt(btn.dataset.ms, 10);
-                if (scrollActive) startScrolling();
-              });
-            });
-
-            const ttsFullText = __TTS_TEXT_JSON__;
-            let ttsChunks = [];
-            let ttsIndex = 0;
-            let ttsSpeaking = false;
-
-            function chunkText(text) {
-              const sentences = text.match(/[^.!?]+[.!?]*/g) || [text];
-              const chunks = [];
-              let current = "";
-              for (const s of sentences) {
-                if ((current + s).length > 200 && current) {
-                  chunks.push(current.trim());
-                  current = s;
-                } else {
-                  current += s;
-                }
-              }
-              if (current.trim()) chunks.push(current.trim());
-              return chunks;
+        ttsBtn.addEventListener('click', () => {
+          if (!('speechSynthesis' in window)) return;
+          if (!ttsSpeaking) {
+            if (window.speechSynthesis.paused) {
+              window.speechSynthesis.resume();
+            } else {
+              ttsChunks = chunkText(ttsFullText);
+              ttsIndex = 0;
+              window.speechSynthesis.cancel();
+              speakNext();
             }
-
-            function speakNext() {
-              if (ttsIndex >= ttsChunks.length) {
-                ttsSpeaking = false;
-                ttsBtn.textContent = '🔊 Read Aloud';
-                return;
-              }
-              const utter = new SpeechSynthesisUtterance(ttsChunks[ttsIndex]);
-              utter.onend = () => { ttsIndex += 1; speakNext(); };
-              window.speechSynthesis.speak(utter);
-            }
-
-            ttsBtn.addEventListener('click', () => {
-              if (!('speechSynthesis' in window)) return;
-              if (!ttsSpeaking) {
-                if (window.speechSynthesis.paused) {
-                  window.speechSynthesis.resume();
-                } else {
-                  ttsChunks = chunkText(ttsFullText);
-                  ttsIndex = 0;
-                  window.speechSynthesis.cancel();
-                  speakNext();
-                }
-                ttsSpeaking = true;
-                ttsBtn.textContent = '⏸ Pause Reading';
-              } else {
-                window.speechSynthesis.pause();
-                ttsSpeaking = false;
-                ttsBtn.textContent = '▶️ Resume Reading';
-              }
-            });
-          })();
-        </script>
-        """
+            ttsSpeaking = true;
+            ttsBtn.textContent = '⏸ Pause Reading';
+          } else {
+            window.speechSynthesis.pause();
+            ttsSpeaking = false;
+            ttsBtn.textContent = '▶️ Resume Reading';
+          }
+        });
+      })();
+    </script>
+    """
 
     tts_json = json_for_script(plain_text_for_tts)
 
     doc = (
         template
         .replace("{{ pane_height }}", str(pane_height))
-        .replace("__PANE_HEIGHT__", str(pane_height))
-        .replace("{{ font_family }}", font_family)
-        .replace("__FONT_FAMILY__", font_family)
-        .replace("{{ font_size }}", str(font_size))
-        .replace("__FONT_SIZE__", str(font_size))
-        .replace("{{ theme_style }}", theme_style)
-        .replace("__THEME_STYLE__", theme_style)
-        .replace("{{ content }}", html_content)
-        .replace("__HTML_CONTENT__", html_content)
-        .replace("{{ tts_text_json }}", tts_json)
-        .replace("__TTS_TEXT_JSON__", tts_json)
-    )
-    components.html(doc, height=pane_height + 70, scrolling=False)
-
-
-# ---------------------------------------------------------------------------
-# UI Entrypoint
-# ---------------------------------------------------------------------------
-
-st.title("📖 Clean 9:16 Reader")
-
-if not sb:
-    st.info("💡 Supabase not connected. Operating in session memory mode.")
-
-history_list = load_history()
-selected_history_url = None
-
-if history_list:
-    with st.expander("🕒 Recent URLs", expanded=False):
-        chosen = st.selectbox("Select a previously accessed page:", ["-- Select from history --"] + history_list, index=0)
-        if chosen != "-- Select from history --":
-            selected_history_url = chosen
-        if st.button("🗑️ Clear History"):
-            clear_history()
-            st.rerun()
-
-library_items = load_library()
-loaded_from_library = None
-
-if library_items:
-    with st.expander(f"📚 Saved Articles ({len(library_items)})", expanded=False):
-        for entry in library_items:
-            art_id = entry["id"]
-            col_title, col_open, col_txt, col_html, col_del = st.columns([4, 1.3, 1, 1, 1])
-            col_title.write(entry.get("title", entry.get("url", "Untitled")))
-            if col_open.button("Open", key=f"open_{art_id}"):
-                loaded_from_library = entry["content"]
-            col_txt.download_button(
-                "⬇️ .txt",
-                data=to_plain_text_for_export(entry["content"]),
-                file_name=f"{entry.get('title', 'article')[:60]}.txt",
-                mime="text/plain",
-                key=f"dl_txt_{art_id}",
-            )
-            col_html.download_button(
-                "⬇️ .html",
-                data=entry["content"],
-                file_name=f"{entry.get('title', 'article')[:60]}.html",
-                mime="text/html",
-                key=f"dl_html_{art_id}",
-            )
-            if col_del.button("🗑️", key=f"del_{art_id}"):
-                delete_from_library(art_id)
-                st.rerun()
-
-col_input, col_ia_check, col_clear = st.columns([3, 1, 0.8])
-with col_input:
-    url_input = st.text_input(
-        "Paste URL (Article, Recipe, OneDrive, PDF, or text):",
-        value=selected_history_url if selected_history_url else "",
-        placeholder="https://...",
-    )
-with col_ia_check:
-    st.write("")
-    st.write("")
-    use_wayback = st.checkbox("🏛️ Wayback", help="Force retrieval from Internet Archive snapshot")
-with col_clear:
-    st.write("")
-    st.write("")
-    if st.button("🔄 Cache", help="Flush cached pages and re-fetch"):
-        st.cache_data.clear()
-        st.toast("Cache flushed!", icon="🧹")
-        st.rerun()
-
-uploaded_file = st.file_uploader("Or upload document:", type=["txt", "pdf", "docx", "epub", "rtf", "md"])
-
-with st.expander("📋 Manual Text / Recipe Paste (Fallback)"):
-    manual_text = st.text_area("Paste raw text or recipe directions here:", height=150)
-
-content = ""
-active_source_url = None
-
-if loaded_from_library:
-    content = loaded_from_library
-elif manual_text.strip():
-    content = format_plain_text(manual_text)
-elif url_input:
-    with st.spinner("Extracting & formatting..."):
-        result = extract_from_url(url_input, prefer_wayback=use_wayback)
-        if result.ok:
-            content = result.content
-            active_source_url = url_input
-        else:
-            st.error(result.message)
-elif uploaded_file:
-    with st.spinner("Formatting file..."):
-        try:
-            b = uploaded_file.read()
-            ext = uploaded_file.name.split(".")[-1].lower()
-            if ext == "pdf":
-                content = extract_pdf(b)
-            elif ext == "docx":
-                content = extract_docx(b)
-            elif ext == "epub":
-                content = extract_epub(b)
-            elif ext == "rtf":
-                content = extract_rtf(b)
-            elif ext == "md":
-                content = extract_markdown(b)
-            else:
-                content = format_plain_text(decode_bytes(b))
-        except Exception as e:
-            st.error(f"Error parsing file: {e}")
-
-if content:
-    if active_source_url:
-        save_url_to_history(active_source_url)
-
-    raw_plain_text = BeautifulSoup(content, "html.parser").get_text(separator=" ")
-    word_count = len(raw_plain_text.split())
-    reading_time_min = max(1, round(word_count / 200)) if word_count > 0 else 0
-
-    st.divider()
-
-    col_meta, col_copy = st.columns([3, 2])
-    with col_meta:
-        st.markdown(
-            f"<div class='meta-chip'>⏱️ ~{reading_time_min} min read &nbsp;•&nbsp; {word_count:,} words</div>",
-            unsafe_allow_html=True,
-        )
-    with col_copy:
-        with st.popover("📋 Copy Text"):
-            st.code(raw_plain_text, language=None)
-
-    save_key = active_source_url or f"upload_{hash(content[:60])}"
-    if st.button("💾 Save to Supabase Library (read offline later)"):
-        sanitized = sanitize_html(content)
-        title = guess_title(sanitized, fallback=active_source_url or "Uploaded Document")
-        if save_to_library(save_key, title, sanitized, word_count):
-            st.success("Saved to Supabase.")
-            st.rerun()
-        else:
-            st.error("Could not save to Supabase. Verify database connections.")
-
-    with st.expander("⚙️ Reader Controls", expanded=False):
-        font_family_opt = st.selectbox("Typeface", ["Sans-Serif", "Serif", "Monospace"], key="reader_font")
-        font_size_val = st.slider("Font Size (px)", min_value=14, max_value=32, value=18, step=1, key="reader_size")
-        theme = st.selectbox("Color Theme", ["Light", "Sepia", "Dark"], key="reader_theme")
-        pane_height_val = st.slider(
-            "Reading Pane Height (px)", min_value=400, max_value=1000, value=600, step=50, key="reader_pane_height"
-        )
-        st.caption("Scroll and read-aloud controls are located in the top toolbar of the reader below.")
-
-    font_map = {
-        "Sans-Serif": "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-        "Serif": "Georgia, Cambria, 'Times New Roman', serif",
-        "Monospace": "Menlo, Consolas, Monaco, monospace",
-    }
-    theme_map = {
-        "Light": "background-color: #ffffff; color: #111111;",
-        "Sepia": "background-color: #fbf0d9; color: #433422;",
-        "Dark": "background-color: #1a1a1a; color: #e0e0e0;",
-    }
-
-    safe_content = sanitize_html(content)
-
-    render_reader(
-        html_content=safe_content,
-        plain_text_for_tts=raw_plain_text,
-        font_family=font_map[font_family_opt],
-        font_size=font_size_val,
-        theme_style=theme_map[theme],
-        pane_height=pane_height_val,
-    )
+        .replace("__P
