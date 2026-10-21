@@ -4,12 +4,18 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+
     html, body {
       margin: 0;
       padding: 0;
       height: 100%;
       position: relative;
-      font-family: -apple-system, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      overflow: hidden;
     }
 
     #progress-container {
@@ -17,7 +23,7 @@
       top: 0;
       left: 0;
       width: 100%;
-      height: 6px;
+      height: 4px;
       background: rgba(128, 128, 128, 0.2);
       z-index: 9999;
     }
@@ -35,26 +41,35 @@
       -webkit-overflow-scrolling: touch;
       align-items: center;
       gap: 6px;
-      padding: 8px 8px 6px 8px;
-      background: #f2f2f2;
-      border-bottom: 1px solid #ddd;
-      margin-top: 6px;
-      scrollbar-width: thin;
+      padding: 8px 10px;
+      background: #f8f9fa;
+      border-bottom: 1px solid #e2e8f0;
+      scrollbar-width: none; /* Hide on Firefox */
     }
+    #toolbar::-webkit-scrollbar {
+      display: none; /* Hide on Chrome/Safari */
+    }
+
     .ctrl-btn, .speed-btn {
       flex-shrink: 0;
-      border: 1px solid #ccc;
-      background: #fff;
-      color: #222;
+      border: 1px solid #cbd5e1;
+      background: #ffffff;
+      color: #1e293b;
       border-radius: 999px;
       padding: 6px 12px;
       font-size: 13px;
+      font-weight: 500;
       cursor: pointer;
       white-space: nowrap;
+      touch-action: manipulation;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    .ctrl-btn:active, .speed-btn:active {
+      transform: scale(0.97);
     }
     .speed-btn.active {
       background: #ff4b4b;
-      color: #fff;
+      color: #ffffff;
       border-color: #ff4b4b;
     }
     .speed-group {
@@ -68,53 +83,73 @@
       position: absolute;
       left: 8px;
       right: 8px;
-      max-width: 420px;
-      box-sizing: border-box;
+      max-width: 440px;
       background: #ffffff;
-      color: #222;
-      border: 1px solid #ccc;
+      color: #0f172a;
+      border: 1px solid #cbd5e1;
       border-radius: 12px;
-      padding: 12px;
+      padding: 14px;
       z-index: 5000;
-      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.2), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+      max-height: 80vh;
+      overflow-y: auto;
     }
-    #settings-panel.open { display: block; }
+    #settings-panel.open { 
+      display: block; 
+    }
     #settings-panel label {
       display: block;
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 600;
-      margin: 10px 0 4px 0;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: #475569;
+      margin: 12px 0 4px 0;
     }
-    #settings-panel label:first-child { margin-top: 0; }
+    #settings-panel label:first-child { 
+      margin-top: 0; 
+    }
     #settings-panel select {
       width: 100%;
-      font-size: 16px;
-      padding: 6px;
-      box-sizing: border-box;
+      font-size: 14px;
+      padding: 8px 10px;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      background: #f8f9fa;
+      color: #1e293b;
     }
-    #settings-panel input[type=range] { width: 100%; }
+    #settings-panel input[type=range] { 
+      width: 100%; 
+      accent-color: #ff4b4b;
+    }
     #sleepStatus {
       font-size: 12px;
-      color: #777;
+      color: #ff4b4b;
+      font-weight: 500;
       margin-top: 6px;
-      min-height: 14px;
+      min-height: 16px;
     }
 
     #reader-scroll {
       height: {{ pane_height }}px;
       overflow-y: auto;
       -webkit-overflow-scrolling: touch;
-      box-sizing: border-box;
+      scroll-behavior: smooth;
     }
     .reader-frame {
       font-family: {{ font_family }};
       font-size: {{ font_size }}px;
       {{ theme_style }}
-      padding: 1.25rem 1rem;
+      padding: 1.25rem 1rem 3rem 1rem;
+      min-height: 100%;
+      word-break: break-word;
     }
     .reader-frame p {
       margin-bottom: 1.35em;
       line-height: 1.8;
+    }
+    .reader-frame h1, .reader-frame h2, .reader-frame h3 {
+      scroll-margin-top: 10px;
     }
   </style>
 </head>
@@ -128,21 +163,21 @@
     <button id="scrollToggleBtn" class="ctrl-btn">▶️ Start Scroll</button>
     <span class="speed-group">
       <button class="speed-btn" data-ms="70">Slow</button>
-      <button class="speed-btn active" data-ms="40">Medium</button>
+      <button class="speed-btn active" data-ms="40">Med</button>
       <button class="speed-btn" data-ms="20">Fast</button>
     </span>
     <button id="ttsBtn" class="ctrl-btn">🔊 Read Aloud</button>
-    <button id="settingsBtn" class="ctrl-btn">⚙️ Voice &amp; Timer</button>
+    <button id="settingsBtn" class="ctrl-btn">⚙️ Audio &amp; Timer</button>
   </div>
 
   <div id="settings-panel">
     <label for="voiceSelect">Voice</label>
     <select id="voiceSelect"></select>
 
-    <label for="rateRange">Speech speed: <span id="rateLabel">1.0×</span></label>
+    <label for="rateRange">Speed: <span id="rateLabel">1.0×</span></label>
     <input type="range" id="rateRange" min="0.6" max="1.8" step="0.1" value="1">
 
-    <label for="sleepSelect">Sleep timer (stops scrolling and reading)</label>
+    <label for="sleepSelect">Sleep Timer</label>
     <select id="sleepSelect">
       <option value="0">Off</option>
       <option value="5">5 minutes</option>
@@ -178,7 +213,7 @@
       const sleepSelect = document.getElementById('sleepSelect');
       const sleepStatus = document.getElementById('sleepStatus');
       const speedBtns = document.querySelectorAll('.speed-btn');
-      const SETTINGS_LABEL = '⚙️ Voice & Timer';
+      const SETTINGS_LABEL = '⚙️ Audio & Timer';
       const synth = ('speechSynthesis' in window) ? window.speechSynthesis : null;
 
       // ---------- Phone Storage & Subway Persistence ----------
@@ -187,18 +222,15 @@
 
       try {
         const currentHtml = readerFrame ? readerFrame.innerHTML.trim() : '';
-        // If content loaded from server, cache it to phone memory
         if (currentHtml && currentHtml.length > 50 && !currentHtml.includes('{{ content }}')) {
           localStorage.setItem(CACHE_KEY, currentHtml);
         } else {
-          // If server delivered blank content (e.g. reload offline), check storage
           const cached = localStorage.getItem(CACHE_KEY);
-          if (cached) {
+          if (cached && offlineRestoreBtn) {
             offlineRestoreBtn.style.display = 'inline-block';
           }
         }
 
-        // Restore scroll position
         const savedScroll = localStorage.getItem(SCROLL_KEY);
         if (savedScroll && scrollEl) {
           scrollEl.scrollTop = parseInt(savedScroll, 10);
@@ -207,16 +239,18 @@
         console.warn('Storage quota or private browsing restriction:', err);
       }
 
-      offlineRestoreBtn.addEventListener('click', function () {
-        const cached = localStorage.getItem(CACHE_KEY);
-        if (cached && readerFrame) {
-          readerFrame.innerHTML = cached;
-          updateProgress();
-          offlineRestoreBtn.style.display = 'none';
-        }
-      });
+      if (offlineRestoreBtn) {
+        offlineRestoreBtn.addEventListener('click', function () {
+          const cached = localStorage.getItem(CACHE_KEY);
+          if (cached && readerFrame) {
+            readerFrame.innerHTML = cached;
+            updateProgress();
+            offlineRestoreBtn.style.display = 'none';
+          }
+        });
+      }
 
-      // ---------- Progress bar & Scroll tracking ----------
+      // ---------- Progress Bar & Position Memory ----------
       function updateProgress() {
         const total = scrollEl.scrollHeight - scrollEl.clientHeight;
         if (total > 0) {
@@ -232,7 +266,7 @@
       });
       updateProgress();
 
-      // ---------- Auto-scroll ----------
+      // ---------- Auto-scroll Engine ----------
       let scrollTimer = null;
       let scrollSpeedMs = 40;
       let scrollActive = false;
@@ -243,12 +277,14 @@
           scrollEl.scrollBy({ top: 1, behavior: 'auto' });
         }, scrollSpeedMs);
       }
+
       function stopScrolling() {
         if (scrollTimer) {
           clearInterval(scrollTimer);
           scrollTimer = null;
         }
       }
+
       function setScrollActive(active) {
         scrollActive = active;
         if (active) {
@@ -263,6 +299,7 @@
       scrollToggleBtn.addEventListener('click', function () {
         setScrollActive(!scrollActive);
       });
+
       speedBtns.forEach(function (btn) {
         btn.addEventListener('click', function () {
           speedBtns.forEach(function (b) { b.classList.remove('active'); });
@@ -272,11 +309,11 @@
         });
       });
 
-      // ---------- Read aloud ----------
+      // ---------- Robust TTS Chunking & Queue Engine ----------
       const ttsFullText = {{ tts_text_json }};
       let ttsChunks = [];
       let ttsIndex = 0;
-      let ttsState = 'idle';
+      let ttsState = 'idle'; // 'idle' | 'playing' | 'paused'
       let ttsSession = 0;
 
       function setTtsUi() {
@@ -285,30 +322,21 @@
         else ttsBtn.textContent = '🔊 Read Aloud';
       }
 
-      function pushSplit(str, out) {
-        while (str.length > 220) {
-          let cut = str.lastIndexOf(' ', 220);
-          if (cut < 80) cut = 220;
-          out.push(str.slice(0, cut).trim());
-          str = str.slice(cut);
-        }
-        if (str.trim()) out.push(str.trim());
-      }
-
       function chunkText(text) {
+        if (!text) return [];
         const out = [];
         text.split(/\n+/).forEach(function (line) {
           const sentences = line.match(/[^.!?]+[.!?]*/g) || [line];
           let current = '';
           sentences.forEach(function (s) {
-            if (current && (current + s).length > 200) {
-              pushSplit(current.trim(), out);
+            if (current && (current + s).length > 180) {
+              out.push(current.trim());
               current = s;
             } else {
               current += s;
             }
           });
-          if (current.trim()) pushSplit(current.trim(), out);
+          if (current.trim()) out.push(current.trim());
         });
         return out.filter(function (c) { return c.length > 0; });
       }
@@ -327,10 +355,15 @@
           setTtsUi();
           return;
         }
+
         const utter = new SpeechSynthesisUtterance(ttsChunks[ttsIndex]);
         const voice = selectedVoice();
-        if (voice) { utter.voice = voice; utter.lang = voice.lang; }
-        utter.rate = parseFloat(rateRange.value) || 1;
+        if (voice) { 
+          utter.voice = voice; 
+          utter.lang = voice.lang; 
+        }
+        utter.rate = parseFloat(rateRange.value) || 1.0;
+        
         utter.onend = function () {
           if (session !== ttsSession) return;
           ttsIndex += 1;
@@ -341,17 +374,18 @@
           ttsState = 'paused';
           setTtsUi();
         };
+
         synth.speak(utter);
       }
 
       function speakFrom(index) {
         ttsSession += 1;
         const session = ttsSession;
-        const wasBusy = synth.speaking || synth.pending;
-        if (wasBusy) synth.cancel();
+        if (synth.speaking || synth.pending) {
+          synth.cancel();
+        }
         ttsIndex = index;
-        if (wasBusy) setTimeout(function () { speakNext(session); }, 60);
-        else speakNext(session);
+        setTimeout(function () { speakNext(session); }, 50);
       }
 
       function startTts() {
@@ -361,12 +395,14 @@
         setTtsUi();
         speakFrom(0);
       }
+
       function pauseTts() {
         ttsSession += 1;
         synth.cancel();
         ttsState = 'paused';
         setTtsUi();
       }
+
       function resumeTts() {
         ttsState = 'playing';
         setTtsUi();
@@ -375,7 +411,7 @@
 
       if (!synth) {
         ttsBtn.disabled = true;
-        ttsBtn.textContent = '🔇 Read aloud unavailable';
+        ttsBtn.textContent = '🔇 Read Aloud Unavailable';
         voiceSelect.disabled = true;
         rateRange.disabled = true;
       } else {
@@ -386,11 +422,12 @@
         });
       }
 
-      // ---------- Voice list ----------
+      // ---------- Voice List Population ----------
       function loadVoices() {
         if (!synth) return;
         const voices = synth.getVoices();
         if (!voices.length) return;
+
         const previous = voiceSelect.value;
         const navLang = (navigator.language || 'en').toLowerCase().split('-')[0];
         const sorted = voices.slice().sort(function (a, b) {
@@ -398,6 +435,7 @@
           const bm = b.lang.toLowerCase().indexOf(navLang) === 0 ? 0 : 1;
           return am - bm || a.name.localeCompare(b.name);
         });
+
         voiceSelect.innerHTML = '';
         sorted.forEach(function (v) {
           const opt = document.createElement('option');
@@ -405,6 +443,7 @@
           opt.textContent = v.name + ' (' + v.lang + ')';
           voiceSelect.appendChild(opt);
         });
+
         const stillThere = sorted.some(function (v) { return v.voiceURI === previous; });
         if (previous && stillThere) {
           voiceSelect.value = previous;
@@ -415,33 +454,39 @@
           voiceSelect.value = preferred.voiceURI;
         }
       }
+
       if (synth) {
         loadVoices();
         if (synth.onvoiceschanged !== undefined) synth.onvoiceschanged = loadVoices;
-        setTimeout(loadVoices, 500);
+        setTimeout(loadVoices, 400);
       }
 
       function restartIfPlaying() {
         if (synth && ttsState === 'playing') speakFrom(ttsIndex);
       }
+
       voiceSelect.addEventListener('change', restartIfPlaying);
       rateRange.addEventListener('input', function () {
         rateLabel.textContent = parseFloat(rateRange.value).toFixed(1) + '×';
       });
       rateRange.addEventListener('change', restartIfPlaying);
 
-      // ---------- Settings panel ----------
-      settingsBtn.addEventListener('click', function () {
+      // ---------- Settings Modal Positioning & Auto-Dismiss ----------
+      settingsBtn.addEventListener('click', function (e) {
+        e.stopPropagation();
         if (!panel.classList.contains('open')) {
           panel.style.top = (toolbar.offsetTop + toolbar.offsetHeight + 4) + 'px';
         }
         panel.classList.toggle('open');
       });
+
       scrollEl.addEventListener('pointerdown', function () {
-        panel.classList.remove('open');
+        if (panel.classList.contains('open')) {
+          panel.classList.remove('open');
+        }
       });
 
-      // ---------- Sleep timer ----------
+      // ---------- Sleep Timer Engine ----------
       let sleepEndsAt = 0;
       let sleepInterval = null;
 
@@ -454,11 +499,19 @@
 
       function stopEverything() {
         setScrollActive(false);
-        if (synth && ttsState === 'playing') pauseTts();
+        if (synth) {
+          synth.cancel();
+          ttsState = 'idle';
+          ttsIndex = 0;
+          setTtsUi();
+        }
       }
 
       function clearSleepTimer() {
-        if (sleepInterval) { clearInterval(sleepInterval); sleepInterval = null; }
+        if (sleepInterval) { 
+          clearInterval(sleepInterval); 
+          sleepInterval = null; 
+        }
         sleepEndsAt = 0;
         sleepSelect.value = '0';
         sleepStatus.textContent = '';
@@ -471,7 +524,7 @@
         if (remaining <= 0) {
           stopEverything();
           clearSleepTimer();
-          sleepStatus.textContent = 'Timer finished. Playback stopped.';
+          sleepStatus.textContent = 'Timer ended. Reading stopped.';
           return;
         }
         sleepStatus.textContent = 'Stopping in ' + formatClock(remaining);
@@ -480,12 +533,15 @@
 
       sleepSelect.addEventListener('change', function () {
         const minutes = parseInt(sleepSelect.value, 10);
-        if (sleepInterval) { clearInterval(sleepInterval); sleepInterval = null; }
+        if (sleepInterval) { 
+          clearInterval(sleepInterval); 
+          sleepInterval = null; 
+        }
         if (!minutes) {
           clearSleepTimer();
           return;
         }
-        sleepEndsAt = Date.now() + minutes * 60000;
+        sleepEndsAt = Date.now() + (minutes * 60000);
         sleepInterval = setInterval(tickSleep, 1000);
         tickSleep();
       });
