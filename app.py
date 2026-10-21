@@ -958,4 +958,214 @@ def render_reader(
     doc = (
         template
         .replace("{{ pane_height }}", str(pane_height))
-        .replace("__P
+        .replace("__PANE_HEIGHT__", str(pane_height))
+        .replace("{{ font_family }}", font_family)
+        .replace("__FONT_FAMILY__", font_family)
+        .replace("{{ font_size }}", str(font_size))
+        .replace("__FONT_SIZE__", str(font_size))
+        .replace("{{ theme_style }}", theme_style)
+        .replace("__THEME_STYLE__", theme_style)
+        .replace("{{ content }}", html_content)
+        .replace("__HTML_CONTENT__", html_content)
+        .replace("{{ tts_text_json }}", tts_json)
+        .replace("__TTS_TEXT_JSON__", tts_json)
+    )
+    components.html(doc, height=pane_height + 70, scrolling=False)
+
+
+# ---------------------------------------------------------------------------
+# UI Entrypoint
+# ---------------------------------------------------------------------------
+
+st.title("📖 Clean 9:16 Reader")
+
+if not sb:
+    st.info("💡 Supabase not connected. Operating in session memory mode.")
+
+history_list = load_history()
+selected_history_url = None
+
+if history_list:
+    with st.expander("🕒 Recent URLs", expanded=False):
+        chosen = st.selectbox("Select a previously accessed page:", ["-- Select from history --"] + history_list, index=0)
+        if chosen != "-- Select from history --":
+            selected_history_url = chosen
+        if st.button("🗑️ Clear History"):
+            clear_history()
+            st.rerun()
+
+library_items = load_library()
+loaded_from_library = None
+
+if library_items:
+    with st.expander(f"📚 Saved Articles ({len(library_items)})", expanded=False):
+        for entry in library_items:
+            art_id = entry["id"]
+            col_title, col_open, col_txt, col_html, col_del = st.columns([4, 1.3, 1, 1, 1])
+            col_title.write(entry.get("title", entry.get("url", "Untitled")))
+            if col_open.button("Open", key=f"open_{art_id}"):
+                loaded_from_library = entry["content"]
+            col_txt.download_button(
+                "⬇️ .txt",
+                data=to_plain_text_for_export(entry["content"]),
+                file_name=f"{entry.get('title', 'article')[:60]}.txt",
+                mime="text/plain",
+                key=f"dl_txt_{art_id}",
+            )
+            col_html.download_button(
+                "⬇️ .html",
+                data=entry["content"],
+                file_name=f"{entry.get('title', 'article')[:60]}.html",
+                mime="text/html",
+                key=f"dl_html_{art_id}",
+            )
+            if col_del.button("🗑️", key=f"del_{art_id}"):
+                delete_from_library(art_id)
+                st.rerun()
+
+col_input, col_ia_check, col_clear = st.columns([3, 1, 0.8])
+with col_input:
+    url_input = st.text_input(
+        "Paste URL (Article, Recipe, OneDrive, PDF, or text):",
+        value=selected_history_url if selected_history_url else "",
+        placeholder="https://...",
+    )
+with col_ia_check:
+    st.write("")
+    st.write("")
+    use_wayback = st.checkbox("🏛️ Wayback", help="Force retrieval from Internet Archive snapshot")
+with col_clear:
+    st.write("")
+    st.write("")
+    if st.button("🔄 Cache", help="Flush cached pages and re-fetch"):
+        st.cache_data.clear()
+        st.toast("Cache flushed!", icon="🧹")
+        st.rerun()
+
+uploaded_file = st.file_uploader("Or upload document:", type=["txt", "pdf", "docx", "epub", "rtf", "md"])
+
+with st.expander("📋 Manual Text / Recipe Paste (Fallback)"):
+    manual_text = st.text_area("Paste raw text or recipe directions here:", height=150)
+
+content = ""
+active_source_url = None
+
+if loaded_from_library:
+    content = loaded_from_library
+elif manual_text.strip():
+    content = format_plain_text(manual_text)
+elif url_input:
+    with st.spinner("Extracting & formatting..."):
+        result = extract_from_url(url_input, prefer_wayback=use_wayback)
+        if result.ok:
+            content = result.content
+            active_source_url = url_input
+        else:
+            st.error(result.message)
+elif uploaded_file:
+    with st.spinner("Formatting file..."):
+        try:
+            b = uploaded_file.read()
+            ext = uploaded_file.name.split(".")[-1].lower()
+            if ext == "pdf":
+                content = extract_pdf(b)
+            elif ext == "docx":
+                content = extract_docx(b)
+            elif ext == "epub":
+                content = extract_epub(b)
+            elif ext == "rtf":
+                content = extract_rtf(b)
+            elif ext == "md":
+                content = extract_markdown(b)
+            else:
+                content = format_plain_text(decode_bytes(b))
+        except Exception as e:
+            st.error(f"Error parsing file: {e}")
+
+if content:
+    if active_source_url:
+        save_url_to_history(active_source_url)
+
+    # Check if content has recipe characteristics
+    is_recipe_doc = "ingredient" in content.lower() and ("direction" in content.lower() or "instruction" in content.lower())
+
+    # --- Scaler Controls ---
+    scale_multiplier = 1.0
+    if is_recipe_doc:
+        col_scale_lbl, col_scale_btn = st.columns([2, 3])
+        with col_scale_lbl:
+            st.markdown("🍳 **Scale Servings:**")
+        with col_scale_btn:
+            scale_choice = st.radio(
+                "Scale",
+                options=["0.5x (Half)", "1x (Normal)", "2x (Double)", "3x (Triple)"],
+                index=1,
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+            mult_map = {"0.5x (Half)": 0.5, "1x (Normal)": 1.0, "2x (Double)": 2.0, "3x (Triple)": 3.0}
+            scale_multiplier = mult_map[scale_choice]
+
+        if scale_multiplier != 1.0:
+            content = scale_recipe_html(content, scale_multiplier)
+
+    # --- Heading Anchors & Table of Contents ---
+    anchored_content, toc_items = inject_chapter_anchors(content)
+    toc_markup = build_toc_html(toc_items)
+
+    final_rendered_html = sanitize_html(toc_markup + anchored_content)
+
+    raw_plain_text = BeautifulSoup(final_rendered_html, "html.parser").get_text(separator=" ")
+    word_count = len(raw_plain_text.split())
+    reading_time_min = max(1, round(word_count / 200)) if word_count > 0 else 0
+
+    st.divider()
+
+    col_meta, col_copy = st.columns([3, 2])
+    with col_meta:
+        st.markdown(
+            f"<div class='meta-chip'>⏱️ ~{reading_time_min} min read &nbsp;•&nbsp; {word_count:,} words</div>",
+            unsafe_allow_html=True,
+        )
+    with col_copy:
+        with st.popover("📋 Copy Text"):
+            st.code(raw_plain_text, language=None)
+
+    save_key = active_source_url or f"upload_{hash(content[:60])}"
+    if st.button("💾 Save to Supabase Library (read offline later)"):
+        sanitized = sanitize_html(content)
+        title = guess_title(sanitized, fallback=active_source_url or "Uploaded Document")
+        if save_to_library(save_key, title, sanitized, word_count):
+            st.success("Saved to Supabase.")
+            st.rerun()
+        else:
+            st.error("Could not save to Supabase. Verify database connections.")
+
+    with st.expander("⚙️ Reader Controls", expanded=False):
+        font_family_opt = st.selectbox("Typeface", ["Sans-Serif", "Serif", "Monospace"], key="reader_font")
+        font_size_val = st.slider("Font Size (px)", min_value=14, max_value=32, value=18, step=1, key="reader_size")
+        theme = st.selectbox("Color Theme", ["Light", "Sepia", "Dark"], key="reader_theme")
+        pane_height_val = st.slider(
+            "Reading Pane Height (px)", min_value=400, max_value=1000, value=600, step=50, key="reader_pane_height"
+        )
+        st.caption("Scroll and read-aloud controls are located in the top toolbar of the reader below.")
+
+    font_map = {
+        "Sans-Serif": "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+        "Serif": "Georgia, Cambria, 'Times New Roman', serif",
+        "Monospace": "Menlo, Consolas, Monaco, monospace",
+    }
+    theme_map = {
+        "Light": "background-color: #ffffff; color: #111111;",
+        "Sepia": "background-color: #fbf0d9; color: #433422;",
+        "Dark": "background-color: #1a1a1a; color: #e0e0e0;",
+    }
+
+    render_reader(
+        html_content=final_rendered_html,
+        plain_text_for_tts=raw_plain_text,
+        font_family=font_map[font_family_opt],
+        font_size=font_size_val,
+        theme_style=theme_map[theme],
+        pane_height=pane_height_val,
+    )
