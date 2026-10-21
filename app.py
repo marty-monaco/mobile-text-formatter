@@ -1,7 +1,7 @@
 """
 Clean Reader — mobile-friendly text/recipe/article reader with Supabase persistence,
 Internet Archive recovery, dedicated Medium/Substack extraction, recipe scaling,
-chapter navigation, and offline subway cache.
+intelligent chapter navigation, and offline subway cache.
 """
 
 import html
@@ -65,7 +65,6 @@ def sanitize_html(raw_html: str) -> str:
     soup = BeautifulSoup(cleaned, "html.parser")
     for a in soup.find_all("a"):
         href = a.get("href", "")
-        # Preserve internal section anchor links
         if href.startswith("#"):
             a["target"] = "_self"
             continue
@@ -324,7 +323,7 @@ def format_amount(amount: float) -> str:
     if amount <= 0:
         return ""
     whole = math.floor(amount)
-    frac = round((amount - whole) * 8) / 8  # round to nearest eighth
+    frac = round((amount - whole) * 8) / 8
     frac_map = {
         0.125: "⅛", 0.25: "¼", 0.375: "⅜", 0.5: "½",
         0.625: "⅝", 0.75: "¾", 0.875: "⅞",
@@ -360,7 +359,6 @@ def scale_recipe_html(content_html: str, multiplier: float) -> str:
     if multiplier == 1.0:
         return content_html
     soup = BeautifulSoup(content_html, "html.parser")
-    # Identify ingredient sections (list items inside an ingredients block)
     for ul in soup.find_all(["ul", "ol"]):
         prev_heading = ul.find_previous(["h2", "h3", "h4", "p", "strong"])
         if prev_heading and "ingredient" in prev_heading.get_text().lower():
@@ -370,33 +368,44 @@ def scale_recipe_html(content_html: str, multiplier: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Chapter & Section Navigation Engine
+# Filtered Chapter Navigation Engine
 # ---------------------------------------------------------------------------
 
-def inject_chapter_anchors(content_html: str) -> Tuple[str, List[Tuple[str, str, int]]]:
-    """Injects unique IDs into headings and returns a list of (id, title, level)."""
+EXCLUDE_HEADING_PATTERNS = re.compile(
+    r"^(step\s*\d+|ingredients?|directions?|instructions?|preparation|prep|method|cooking\s*notes?|notes?|yield|prep\s*time|cook\s*time|nutrition|featured\s*in|ratings?|reviews?|share|comments?)$",
+    re.IGNORECASE,
+)
+
+def inject_chapter_anchors(content_html: str, is_recipe: bool = False) -> Tuple[str, List[Tuple[str, str, int]]]:
+    """Injects unique IDs into true article headings. Completely suppresses TOC on recipes."""
+    if is_recipe:
+        return content_html, []
+
     soup = BeautifulSoup(content_html, "html.parser")
-    headings = soup.find_all(["h1", "h2", "h3"])
+    headings = soup.find_all(["h1", "h2"])
     toc: List[Tuple[str, str, int]] = []
 
     for i, h in enumerate(headings, 1):
         text = h.get_text(strip=True)
-        if not text or len(text) < 2:
+        if not text or len(text) < 4 or EXCLUDE_HEADING_PATTERNS.match(text):
             continue
         anchor_id = f"section-{i}"
         h["id"] = anchor_id
         level = int(h.name[1])
         toc.append((anchor_id, text, level))
 
+    if len(toc) < 3:
+        return content_html, []
+
     return str(soup), toc
 
 
 def build_toc_html(toc: List[Tuple[str, str, int]]) -> str:
-    if len(toc) < 2:
+    if not toc:
         return ""
     items = []
     for anchor_id, title, level in toc:
-        indent = "12px" if level == 2 else ("24px" if level >= 3 else "0px")
+        indent = "14px" if level >= 2 else "0px"
         items.append(
             f"<li style='margin-left:{indent}; margin-bottom:6px; list-style:none;'>"
             f"<a href='#{anchor_id}' style='text-decoration:none; color:inherit; opacity:0.85;'>• {html.escape(title)}</a>"
@@ -762,7 +771,7 @@ def extract_from_url(raw_input: str, prefer_wayback: bool = False) -> ExtractRes
 
 
 # ---------------------------------------------------------------------------
-# Reader Rendering with Offline Subway Persistence
+# Reader Rendering with Native JS Auto-Scroll & TTS
 # ---------------------------------------------------------------------------
 
 def render_reader(
@@ -775,16 +784,17 @@ def render_reader(
 ):
     template = """
     <style>
+      *, *::before, *::after { box-sizing: border-box; }
       html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, sans-serif; }
       #progress-container {
-          position: fixed; top: 0; left: 0; width: 100%; height: 6px;
+          position: fixed; top: 0; left: 0; width: 100%; height: 5px;
           background: rgba(128,128,128,0.2); z-index: 999;
       }
       #progress-bar { width: 0%; height: 100%; background-color: #ff4b4b; transition: width 0.1s ease-out; }
       #toolbar {
           display: flex; flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch;
           align-items: center; gap: 6px; padding: 8px 8px 6px 8px; background: #f2f2f2;
-          border-bottom: 1px solid #ddd; margin-top: 6px;
+          border-bottom: 1px solid #ddd; margin-top: 5px;
       }
       .ctrl-btn, .speed-btn {
           flex-shrink: 0; border: 1px solid #ccc; background: #fff; color: #222;
@@ -794,17 +804,19 @@ def render_reader(
       .speed-group { display: flex; flex-shrink: 0; gap: 4px; }
       #reader-scroll {
           height: __PANE_HEIGHT__px; overflow-y: auto; -webkit-overflow-scrolling: touch;
-          box-sizing: border-box; scroll-behavior: smooth;
+          box-sizing: border-box;
       }
       .reader-frame {
           font-family: __FONT_FAMILY__; font-size: __FONT_SIZE__px; __THEME_STYLE__
-          padding: 1.25rem 1rem;
+          padding: 1.25rem 1rem 3rem 1rem;
+          word-break: break-word;
       }
       .reader-frame p { margin-bottom: 1.35em; line-height: 1.8; }
+      .reader-frame h1, .reader-frame h2, .reader-frame h3 { scroll-margin-top: 10px; }
     </style>
     <div id="progress-container"><div id="progress-bar"></div></div>
     <div id="toolbar">
-      <button id="offlineRestoreBtn" class="ctrl-btn" style="display:none; background:#ff4b4b; color:#fff; border-color:#ff4b4b;">🚇 Restore Subway Cache</button>
+      <button id="offlineRestoreBtn" class="ctrl-btn" style="display:none; background:#ff4b4b; color:#fff; border-color:#ff4b4b;">🚇 Restore Cache</button>
       <button id="scrollToggleBtn" class="ctrl-btn">▶️ Start Scroll</button>
       <span class="speed-group">
         <button class="speed-btn" data-ms="70">Slow</button>
@@ -829,6 +841,7 @@ def render_reader(
         const CACHE_KEY = 'subway_cached_article';
         const SCROLL_KEY = 'subway_scroll_top';
 
+        // --- 1. Subway Offline Persistence ---
         try {
           const currentHtml = readerFrame ? readerFrame.innerHTML.trim() : '';
           if (currentHtml && currentHtml.length > 50 && !currentHtml.includes('__HTML_CONTENT__')) {
@@ -839,9 +852,7 @@ def render_reader(
           }
           const savedScroll = localStorage.getItem(SCROLL_KEY);
           if (savedScroll && scrollEl) scrollEl.scrollTop = parseInt(savedScroll, 10);
-        } catch(e) {
-          console.warn('Storage quota or private mode', e);
-        }
+        } catch(e) {}
 
         if (offlineRestoreBtn) {
           offlineRestoreBtn.addEventListener('click', function() {
@@ -854,61 +865,83 @@ def render_reader(
           });
         }
 
+        // --- 2. Progress Bar Tracking ---
         function updateProgress() {
+          if (!scrollEl || !bar) return;
           const total = scrollEl.scrollHeight - scrollEl.clientHeight;
           if (total > 0) { bar.style.width = (scrollEl.scrollTop / total * 100) + '%'; }
         }
-        scrollEl.addEventListener('scroll', function() {
+        if (scrollEl) {
+          scrollEl.addEventListener('scroll', function() {
+            updateProgress();
+            try { localStorage.setItem(SCROLL_KEY, scrollEl.scrollTop); } catch(e) {}
+          });
           updateProgress();
-          try { localStorage.setItem(SCROLL_KEY, scrollEl.scrollTop); } catch(e) {}
-        });
-        updateProgress();
+        }
 
+        // --- 3. Reliable Auto-Scroll Engine ---
         let scrollTimer = null;
         let scrollSpeedMs = 40;
         let scrollActive = false;
 
         function startScrolling() {
-          if (scrollTimer) clearInterval(scrollTimer);
-          scrollTimer = setInterval(() => {
-            scrollEl.scrollBy({ top: 1, behavior: 'auto' });
+          if (scrollTimer) { clearInterval(scrollTimer); scrollTimer = null; }
+          scrollTimer = setInterval(function() {
+            if (!scrollEl) return;
+            if (scrollEl.scrollTop + scrollEl.clientHeight >= scrollEl.scrollHeight - 2) {
+              setScrollActive(false);
+              return;
+            }
+            scrollEl.scrollTop += 1;
           }, scrollSpeedMs);
         }
+
         function stopScrolling() {
           if (scrollTimer) { clearInterval(scrollTimer); scrollTimer = null; }
         }
 
-        scrollToggleBtn.addEventListener('click', () => {
-          scrollActive = !scrollActive;
-          if (scrollActive) {
+        function setScrollActive(active) {
+          scrollActive = active;
+          if (!scrollToggleBtn) return;
+          if (active) {
             startScrolling();
             scrollToggleBtn.textContent = '⏸ Pause Scroll';
           } else {
             stopScrolling();
             scrollToggleBtn.textContent = '▶️ Start Scroll';
           }
-        });
+        }
 
-        speedBtns.forEach(btn => {
-          btn.addEventListener('click', () => {
-            speedBtns.forEach(b => b.classList.remove('active'));
+        if (scrollToggleBtn) {
+          scrollToggleBtn.addEventListener('click', function() {
+            setScrollActive(!scrollActive);
+          });
+        }
+
+        speedBtns.forEach(function(btn) {
+          btn.addEventListener('click', function() {
+            speedBtns.forEach(function(b) { b.classList.remove('active'); });
             btn.classList.add('active');
             scrollSpeedMs = parseInt(btn.dataset.ms, 10);
             if (scrollActive) startScrolling();
           });
         });
 
+        // --- 4. Web Speech API (TTS) Queue ---
+        const synth = ('speechSynthesis' in window) ? window.speechSynthesis : null;
         const ttsFullText = __TTS_TEXT_JSON__;
         let ttsChunks = [];
         let ttsIndex = 0;
         let ttsSpeaking = false;
 
         function chunkText(text) {
+          if (!text) return [];
           const sentences = text.match(/[^.!?]+[.!?]*/g) || [text];
           const chunks = [];
           let current = "";
-          for (const s of sentences) {
-            if ((current + s).length > 200 && current) {
+          for (let i = 0; i < sentences.length; i++) {
+            const s = sentences[i];
+            if ((current + s).length > 180 && current) {
               chunks.push(current.trim());
               current = s;
             } else {
@@ -920,35 +953,46 @@ def render_reader(
         }
 
         function speakNext() {
-          if (ttsIndex >= ttsChunks.length) {
+          if (!synth || ttsIndex >= ttsChunks.length) {
             ttsSpeaking = false;
-            ttsBtn.textContent = '🔊 Read Aloud';
+            if (ttsBtn) ttsBtn.textContent = '🔊 Read Aloud';
             return;
           }
           const utter = new SpeechSynthesisUtterance(ttsChunks[ttsIndex]);
-          utter.onend = () => { ttsIndex += 1; speakNext(); };
-          window.speechSynthesis.speak(utter);
+          utter.onend = function() {
+            ttsIndex += 1;
+            speakNext();
+          };
+          utter.onerror = function() {
+            ttsSpeaking = false;
+            if (ttsBtn) ttsBtn.textContent = '🔊 Read Aloud';
+          };
+          synth.speak(utter);
         }
 
-        ttsBtn.addEventListener('click', () => {
-          if (!('speechSynthesis' in window)) return;
-          if (!ttsSpeaking) {
-            if (window.speechSynthesis.paused) {
-              window.speechSynthesis.resume();
+        if (!synth && ttsBtn) {
+          ttsBtn.disabled = true;
+          ttsBtn.textContent = '🔇 Audio Unavailable';
+        } else if (ttsBtn) {
+          ttsBtn.addEventListener('click', function() {
+            if (!ttsSpeaking) {
+              if (synth.paused) {
+                synth.resume();
+              } else {
+                ttsChunks = chunkText(ttsFullText);
+                ttsIndex = 0;
+                synth.cancel();
+                speakNext();
+              }
+              ttsSpeaking = true;
+              ttsBtn.textContent = '⏸ Pause Reading';
             } else {
-              ttsChunks = chunkText(ttsFullText);
-              ttsIndex = 0;
-              window.speechSynthesis.cancel();
-              speakNext();
+              synth.pause();
+              ttsSpeaking = false;
+              ttsBtn.textContent = '▶️ Resume Reading';
             }
-            ttsSpeaking = true;
-            ttsBtn.textContent = '⏸ Pause Reading';
-          } else {
-            window.speechSynthesis.pause();
-            ttsSpeaking = false;
-            ttsBtn.textContent = '▶️ Resume Reading';
-          }
-        });
+          });
+        }
       })();
     </script>
     """
@@ -957,17 +1001,11 @@ def render_reader(
 
     doc = (
         template
-        .replace("{{ pane_height }}", str(pane_height))
         .replace("__PANE_HEIGHT__", str(pane_height))
-        .replace("{{ font_family }}", font_family)
         .replace("__FONT_FAMILY__", font_family)
-        .replace("{{ font_size }}", str(font_size))
         .replace("__FONT_SIZE__", str(font_size))
-        .replace("{{ theme_style }}", theme_style)
         .replace("__THEME_STYLE__", theme_style)
-        .replace("{{ content }}", html_content)
         .replace("__HTML_CONTENT__", html_content)
-        .replace("{{ tts_text_json }}", tts_json)
         .replace("__TTS_TEXT_JSON__", tts_json)
     )
     components.html(doc, height=pane_height + 70, scrolling=False)
@@ -1086,10 +1124,12 @@ if content:
     if active_source_url:
         save_url_to_history(active_source_url)
 
-    # Check if content has recipe characteristics
-    is_recipe_doc = "ingredient" in content.lower() and ("direction" in content.lower() or "instruction" in content.lower())
+    # Robust recipe detection covering NYT Cooking and varied cooking vocabulary
+    is_recipe_url = any(dom in (active_source_url or "").lower() for dom in ("cooking.nytimes.com", "allrecipes.com", "seriouseats.com", "epicurious.com"))
+    has_recipe_terms = "ingredient" in content.lower() and any(k in content.lower() for k in ("preparation", "direction", "instruction", "method", "steps", "servings"))
+    is_recipe_doc = is_recipe_url or has_recipe_terms
 
-    # --- Scaler Controls ---
+    # --- Scaler Controls (Visible only on recipes) ---
     scale_multiplier = 1.0
     if is_recipe_doc:
         col_scale_lbl, col_scale_btn = st.columns([2, 3])
@@ -1109,8 +1149,8 @@ if content:
         if scale_multiplier != 1.0:
             content = scale_recipe_html(content, scale_multiplier)
 
-    # --- Heading Anchors & Table of Contents ---
-    anchored_content, toc_items = inject_chapter_anchors(content)
+    # --- Heading Anchors & Table of Contents (Bypassed on recipes) ---
+    anchored_content, toc_items = inject_chapter_anchors(content, is_recipe=is_recipe_doc)
     toc_markup = build_toc_html(toc_items)
 
     final_rendered_html = sanitize_html(toc_markup + anchored_content)
