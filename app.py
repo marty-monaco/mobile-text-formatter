@@ -421,4 +421,725 @@ def format_recipe_output(recipe: dict) -> str:
     for step in raw_steps:
         if isinstance(step, str):
             steps.append(step)
-        elif isinstance(step, dict) and "text
+        elif isinstance(step, dict) and "text" in step:
+            steps.append(step["text"])
+
+    out = [f"<h2>{html.escape(title)}</h2>"]
+    if description:
+        out.append(f"<p><em>{html.escape(description)}</em></p>")
+
+    if ingredients:
+        out.append("<h3>Ingredients</h3><ul>")
+        for item in ingredients:
+            out.append(f"<li>{html.escape(item)}</li>")
+        out.append("</ul>")
+
+    if steps:
+        out.append("<h3>Directions</h3><ol>")
+        for step in steps:
+            out.append(f"<li>{html.escape(step)}</li>")
+        out.append("</ol>")
+
+    return "".join(out)
+
+
+def find_recipe_section_by_anchor(raw_html: str) -> Optional[str]:
+    soup = BeautifulSoup(raw_html, "html.parser")
+    anchor = soup.find(
+        lambda tag: tag.name in ("a", "button")
+        and tag.get_text(strip=True)
+        and re.search(r"jump\s*to\s*recipe|go\s*to\s*recipe|print\s*recipe", tag.get_text(strip=True), re.I)
+    )
+    if not anchor:
+        return None
+
+    target_id = None
+    href = anchor.get("href", "")
+    if href.startswith("#"):
+        target_id = href[1:]
+    target_id = target_id or anchor.get("data-target") or anchor.get("aria-controls")
+
+    target = soup.find(id=target_id) if target_id else None
+    if not target:
+        target = soup.find(
+            lambda tag: tag.get("id") and "recipe" in tag.get("id", "").lower()
+        ) or soup.find(
+            lambda tag: tag.get("class")
+            and any(
+                any(m in c.lower() for m in ("recipe-card", "tasty-recipe", "wprm-recipe"))
+                for c in tag.get("class", [])
+            )
+        )
+
+    if not target or len(target.find_all("li")) < 2:
+        return None
+
+    return str(target)
+
+
+# ---------------------------------------------------------------------------
+# Specialized Substack & Medium Resolvers
+# ---------------------------------------------------------------------------
+
+def is_substack_url(url: str, html_text: str = "") -> bool:
+    parsed = urlparse(url)
+    if "substack.com" in parsed.netloc:
+        return True
+    if any(marker in html_text for marker in ("substackcdn.com", "substack-custom-domains", "Substack")):
+        return True
+    return False
+
+
+def extract_substack(url: str) -> Optional[str]:
+    try:
+        parsed = urlparse(url)
+        path_parts = [p for p in parsed.path.split("/") if p]
+        if "p" in path_parts:
+            slug = path_parts[path_parts.index("p") + 1]
+            api_endpoint = f"{parsed.scheme}://{parsed.netloc}/api/v1/posts/{slug}"
+            resp = requests.get(
+                api_endpoint,
+                impersonate="chrome124",
+                timeout=12,
+                headers={"Accept": "application/json"},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                body_html = data.get("body_html", "")
+                title = data.get("title", "")
+                subtitle = data.get("subtitle", "")
+
+                header_html = f"<h2>{html.escape(title)}</h2>"
+                if subtitle:
+                    header_html += f"<p><em>{html.escape(subtitle)}</em></p>"
+
+                if body_html:
+                    return header_html + sanitize_html(body_html)
+    except Exception:
+        pass
+    return None
+
+
+def extract_medium(url: str) -> Optional[str]:
+    freedium_url = f"https://freedium.cfd/{url}"
+    try:
+        resp = requests.get(freedium_url, impersonate="chrome124", timeout=15)
+        if resp.status_code == 200 and len(resp.text) > 500:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            article = soup.find("article") or soup.find("main")
+            if article:
+                return sanitize_html(str(article))
+            body = trafilatura.extract(resp.text, favor_recall=True)
+            if body:
+                return format_plain_text(body)
+    except Exception:
+        pass
+
+    proxy_jina = fetch_jina_proxy(url)
+    if proxy_jina and len(proxy_jina) > 300:
+        return proxy_jina
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Fallback Gateways
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_archive_org_snapshot(target_url: str) -> Optional[Tuple[str, str]]:
+    try:
+        api_url = f"https://archive.org/wayback/available?url={target_url}"
+        resp = requests.get(api_url, timeout=10)
+        if resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        closest = data.get("archived_snapshots", {}).get("closest")
+        if not closest or not closest.get("available"):
+            return None
+
+        raw_url = closest.get("url", "")
+        timestamp = closest.get("timestamp", "")
+        clean_snapshot_url = re.sub(r"/web/(\d{14})/", r"/web/\1id_/", raw_url)
+        if "id_/" not in clean_snapshot_url:
+            clean_snapshot_url = raw_url.replace(f"/web/{timestamp}/", f"/web/{timestamp}id_/")
+
+        archive_resp = requests.get(
+            clean_snapshot_url,
+            impersonate="chrome124",
+            timeout=15,
+            allow_redirects=True,
+        )
+        if archive_resp.status_code == 200 and len(archive_resp.text.strip()) > 300:
+            date_formatted = (
+                f"{timestamp[:4]}-{timestamp[4:6]}-{timestamp[6:8]}"
+                if len(timestamp) >= 8 else "Archived"
+            )
+            return archive_resp.text, date_formatted
+    except Exception:
+        return None
+    return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_jina_proxy(target_url: str) -> str:
+    proxy_url = f"https://r.jina.ai/{target_url}"
+    try:
+        resp = requests.get(proxy_url, impersonate="chrome124", timeout=20)
+        if resp.status_code == 200 and resp.text.strip():
+            return sanitize_html(markdown.markdown(resp.text))
+    except Exception:
+        pass
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Core URL Extractor
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def extract_from_url(raw_input: str, prefer_wayback: bool = False) -> ExtractResult:
+    match = re.search(r"(https?://[^\s]+)", raw_input.strip())
+    if not match:
+        return ExtractResult(ok=False, message="Please enter a valid URL starting with http:// or https://")
+
+    clean_url = match.group(1)
+
+    if is_substack_url(clean_url):
+        substack_content = extract_substack(clean_url)
+        if substack_content:
+            return ExtractResult(ok=True, content=substack_content)
+
+    if "medium.com" in clean_url or any(d in clean_url for d in ("towardsdatascience.com", "betterprogramming.pub")):
+        medium_content = extract_medium(clean_url)
+        if medium_content:
+            return ExtractResult(ok=True, content=medium_content)
+
+    parts = urlsplit(clean_url)
+    preserve_query_domains = ("share.google", "bit.ly", "onedrive.live.com", "1drv.ms")
+    if not any(domain in parts.netloc for domain in preserve_query_domains):
+        clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+    if any(d in parts.netloc for d in ("onedrive.live.com", "1drv.ms")):
+        if "download=1" not in clean_url:
+            clean_url += ("&" if "?" in clean_url else "?") + "download=1"
+
+    if prefer_wayback:
+        archive_res = fetch_archive_org_snapshot(clean_url)
+        if archive_res:
+            arch_html, arch_date = archive_res
+            recipe = extract_recipe_via_scraper(clean_url, html_str=arch_html)
+            if recipe:
+                return ExtractResult(ok=True, content=f"<p class='meta-chip'>🏛️ Snapshot ({arch_date})</p>{recipe}")
+            body = trafilatura.extract(arch_html, favor_recall=True)
+            if body:
+                return ExtractResult(ok=True, content=f"<p class='meta-chip'>🏛️ Snapshot ({arch_date})</p>{format_plain_text(body)}")
+
+    try:
+        resp = requests.get(clean_url, impersonate="chrome124", timeout=15, allow_redirects=True)
+        if resp.encoding is None or resp.encoding.lower() in ("iso-8859-1", "utf-8"):
+            resp.encoding = resp.apparent_encoding or "windows-1252"
+        status = resp.status_code
+        body_text = resp.text
+    except SSLError:
+        return ExtractResult(ok=False, message="Site TLS error. Use the manual paste box below.")
+    except Exception:
+        status = 500
+        body_text = ""
+
+    anti_bot = ["icanhazip.com", "contentlicensing@people.inc", "captcha-delivery.com", "access denied"]
+    is_blocked = status in (403, 429, 500) or any(pat in body_text.lower() for pat in anti_bot)
+
+    if not is_blocked and body_text:
+        if is_substack_url(clean_url, body_text):
+            substack_content = extract_substack(clean_url)
+            if substack_content:
+                return ExtractResult(ok=True, content=substack_content)
+
+        c_type = resp.headers.get("content-type", "").lower()
+        c_disp = resp.headers.get("content-disposition", "").lower()
+        f_url = resp.url.lower()
+
+        if "application/pdf" in c_type or f_url.endswith(".pdf") or ".pdf" in c_disp:
+            return ExtractResult(ok=True, content=extract_pdf(resp.content))
+        if "application/vnd.openxmlformats-officedocument.wordprocessingml.document" in c_type or f_url.endswith(".docx") or ".docx" in c_disp:
+            return ExtractResult(ok=True, content=extract_docx(resp.content))
+        if "application/epub+zip" in c_type or f_url.endswith(".epub") or ".epub" in c_disp:
+            return ExtractResult(ok=True, content=extract_epub(resp.content))
+        if "application/rtf" in c_type or "text/rtf" in c_type or f_url.endswith(".rtf") or ".rtf" in c_disp:
+            return ExtractResult(ok=True, content=extract_rtf(resp.content))
+        if "text/plain" in c_type or f_url.endswith(".txt") or ".txt" in c_disp:
+            return ExtractResult(ok=True, content=format_plain_text(resp.text))
+
+        recipe_scraped = extract_recipe_via_scraper(clean_url, html_str=body_text)
+        if recipe_scraped:
+            return ExtractResult(ok=True, content=recipe_scraped)
+
+        recipe_data = extract_recipe_schema(body_text)
+        if recipe_data:
+            return ExtractResult(ok=True, content=format_recipe_output(recipe_data))
+
+        recipe_section = find_recipe_section_by_anchor(body_text)
+        if recipe_section:
+            return ExtractResult(ok=True, content=sanitize_html(recipe_section))
+
+        body = trafilatura.extract(body_text, include_comments=False) or trafilatura.extract(body_text, favor_recall=True)
+        if body:
+            return ExtractResult(ok=True, content=format_plain_text(body))
+
+    archive_res = fetch_archive_org_snapshot(clean_url)
+    if archive_res:
+        arch_html, arch_date = archive_res
+        recipe = extract_recipe_via_scraper(clean_url, html_str=arch_html)
+        if recipe:
+            return ExtractResult(ok=True, content=f"<p class='meta-chip'>🏛️ Snapshot ({arch_date})</p>{recipe}")
+        recipe_data = extract_recipe_schema(arch_html)
+        if recipe_data:
+            return ExtractResult(ok=True, content=f"<p class='meta-chip'>🏛️ Snapshot ({arch_date})</p>{format_recipe_output(recipe_data)}")
+        body = trafilatura.extract(arch_html, favor_recall=True)
+        if body:
+            return ExtractResult(ok=True, content=f"<p class='meta-chip'>🏛️ Snapshot ({arch_date})</p>{format_plain_text(body)}")
+
+    proxy_content = fetch_jina_proxy(clean_url)
+    if proxy_content:
+        return ExtractResult(ok=True, content=proxy_content)
+
+    return ExtractResult(ok=False, message="Firewalls blocked access and no archive found. Use manual paste below.")
+
+
+# ---------------------------------------------------------------------------
+# Reader Rendering with Native JS Auto-Scroll & TTS
+# ---------------------------------------------------------------------------
+
+def render_reader(
+    html_content: str,
+    plain_text_for_tts: str,
+    font_family: str,
+    font_size: int,
+    theme_style: str,
+    pane_height: int = 600,
+):
+    template = """
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, sans-serif; }
+      #progress-container {
+          position: fixed; top: 0; left: 0; width: 100%; height: 5px;
+          background: rgba(128,128,128,0.2); z-index: 999;
+      }
+      #progress-bar { width: 0%; height: 100%; background-color: #ff4b4b; transition: width 0.1s ease-out; }
+      #toolbar {
+          display: flex; flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch;
+          align-items: center; gap: 6px; padding: 8px 8px 6px 8px; background: #f2f2f2;
+          border-bottom: 1px solid #ddd; margin-top: 5px;
+      }
+      .ctrl-btn, .speed-btn {
+          flex-shrink: 0; border: 1px solid #ccc; background: #fff; color: #222;
+          border-radius: 999px; padding: 6px 12px; font-size: 13px; cursor: pointer; white-space: nowrap;
+      }
+      .speed-btn.active { background: #ff4b4b; color: #fff; border-color: #ff4b4b; }
+      .speed-group { display: flex; flex-shrink: 0; gap: 4px; }
+      #reader-scroll {
+          height: __PANE_HEIGHT__px; overflow-y: auto; -webkit-overflow-scrolling: touch;
+          box-sizing: border-box;
+      }
+      .reader-frame {
+          font-family: __FONT_FAMILY__; font-size: __FONT_SIZE__px; __THEME_STYLE__
+          padding: 1.25rem 1rem 3rem 1rem;
+          word-break: break-word;
+      }
+      .reader-frame p { margin-bottom: 1.35em; line-height: 1.8; }
+    </style>
+    <div id="progress-container"><div id="progress-bar"></div></div>
+    <div id="toolbar">
+      <button id="offlineRestoreBtn" class="ctrl-btn" style="display:none; background:#ff4b4b; color:#fff; border-color:#ff4b4b;">🚇 Restore Cache</button>
+      <button id="scrollToggleBtn" class="ctrl-btn">▶️ Start Scroll</button>
+      <span class="speed-group">
+        <button class="speed-btn" data-ms="70">Slow</button>
+        <button class="speed-btn active" data-ms="40">Medium</button>
+        <button class="speed-btn" data-ms="20">Fast</button>
+      </span>
+      <button id="ttsBtn" class="ctrl-btn">🔊 Read Aloud</button>
+    </div>
+    <div id="reader-scroll">
+      <div class="reader-frame">__HTML_CONTENT__</div>
+    </div>
+    <script>
+      (function() {
+        const scrollEl = document.getElementById('reader-scroll');
+        const readerFrame = document.querySelector('.reader-frame');
+        const bar = document.getElementById('progress-bar');
+        const scrollToggleBtn = document.getElementById('scrollToggleBtn');
+        const offlineRestoreBtn = document.getElementById('offlineRestoreBtn');
+        const ttsBtn = document.getElementById('ttsBtn');
+        const speedBtns = document.querySelectorAll('.speed-btn');
+
+        const CACHE_KEY = 'subway_cached_article';
+        const SCROLL_KEY = 'subway_scroll_top';
+
+        // --- 1. Subway Offline Persistence ---
+        try {
+          const currentHtml = readerFrame ? readerFrame.innerHTML.trim() : '';
+          if (currentHtml && currentHtml.length > 50 && !currentHtml.includes('__HTML_CONTENT__')) {
+            localStorage.setItem(CACHE_KEY, currentHtml);
+          } else {
+            const cached = localStorage.getItem(CACHE_KEY);
+            if (cached && offlineRestoreBtn) offlineRestoreBtn.style.display = 'inline-block';
+          }
+          const savedScroll = localStorage.getItem(SCROLL_KEY);
+          if (savedScroll && scrollEl) scrollEl.scrollTop = parseInt(savedScroll, 10);
+        } catch(e) {}
+
+        if (offlineRestoreBtn) {
+          offlineRestoreBtn.addEventListener('click', function() {
+            const cached = localStorage.getItem(CACHE_KEY);
+            if (cached && readerFrame) {
+              readerFrame.innerHTML = cached;
+              updateProgress();
+              offlineRestoreBtn.style.display = 'none';
+            }
+          });
+        }
+
+        // --- 2. Progress Bar Tracking ---
+        function updateProgress() {
+          if (!scrollEl || !bar) return;
+          const total = scrollEl.scrollHeight - scrollEl.clientHeight;
+          if (total > 0) { bar.style.width = (scrollEl.scrollTop / total * 100) + '%'; }
+        }
+        if (scrollEl) {
+          scrollEl.addEventListener('scroll', function() {
+            updateProgress();
+            try { localStorage.setItem(SCROLL_KEY, scrollEl.scrollTop); } catch(e) {}
+          });
+          updateProgress();
+        }
+
+        // --- 3. Reliable Auto-Scroll Engine ---
+        let scrollTimer = null;
+        let scrollSpeedMs = 40;
+        let scrollActive = false;
+
+        function startScrolling() {
+          if (scrollTimer) { clearInterval(scrollTimer); scrollTimer = null; }
+          scrollTimer = setInterval(function() {
+            if (!scrollEl) return;
+            if (scrollEl.scrollTop + scrollEl.clientHeight >= scrollEl.scrollHeight - 2) {
+              setScrollActive(false);
+              return;
+            }
+            scrollEl.scrollTop += 1;
+          }, scrollSpeedMs);
+        }
+
+        function stopScrolling() {
+          if (scrollTimer) { clearInterval(scrollTimer); scrollTimer = null; }
+        }
+
+        function setScrollActive(active) {
+          scrollActive = active;
+          if (!scrollToggleBtn) return;
+          if (active) {
+            startScrolling();
+            scrollToggleBtn.textContent = '⏸ Pause Scroll';
+          } else {
+            stopScrolling();
+            scrollToggleBtn.textContent = '▶️ Start Scroll';
+          }
+        }
+
+        if (scrollToggleBtn) {
+          scrollToggleBtn.addEventListener('click', function() {
+            setScrollActive(!scrollActive);
+          });
+        }
+
+        speedBtns.forEach(function(btn) {
+          btn.addEventListener('click', function() {
+            speedBtns.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            scrollSpeedMs = parseInt(btn.dataset.ms, 10);
+            if (scrollActive) startScrolling();
+          });
+        });
+
+        // --- 4. Web Speech API (TTS) Queue ---
+        const synth = ('speechSynthesis' in window) ? window.speechSynthesis : null;
+        const ttsFullText = __TTS_TEXT_JSON__;
+        let ttsChunks = [];
+        let ttsIndex = 0;
+        let ttsSpeaking = false;
+
+        function chunkText(text) {
+          if (!text) return [];
+          const sentences = text.match(/[^.!?]+[.!?]*/g) || [text];
+          const chunks = [];
+          let current = "";
+          for (let i = 0; i < sentences.length; i++) {
+            const s = sentences[i];
+            if ((current + s).length > 180 && current) {
+              chunks.push(current.trim());
+              current = s;
+            } else {
+              current += s;
+            }
+          }
+          if (current.trim()) chunks.push(current.trim());
+          return chunks;
+        }
+
+        function speakNext() {
+          if (!synth || ttsIndex >= ttsChunks.length) {
+            ttsSpeaking = false;
+            if (ttsBtn) ttsBtn.textContent = '🔊 Read Aloud';
+            return;
+          }
+          const utter = new SpeechSynthesisUtterance(ttsChunks[ttsIndex]);
+          utter.onend = function() {
+            ttsIndex += 1;
+            speakNext();
+          };
+          utter.onerror = function() {
+            ttsSpeaking = false;
+            if (ttsBtn) ttsBtn.textContent = '🔊 Read Aloud';
+          };
+          synth.speak(utter);
+        }
+
+        if (!synth && ttsBtn) {
+          ttsBtn.disabled = true;
+          ttsBtn.textContent = '🔇 Audio Unavailable';
+        } else if (ttsBtn) {
+          ttsBtn.addEventListener('click', function() {
+            if (!ttsSpeaking) {
+              if (synth.paused) {
+                synth.resume();
+              } else {
+                ttsChunks = chunkText(ttsFullText);
+                ttsIndex = 0;
+                synth.cancel();
+                speakNext();
+              }
+              ttsSpeaking = true;
+              ttsBtn.textContent = '⏸ Pause Reading';
+            } else {
+              synth.pause();
+              ttsSpeaking = false;
+              ttsBtn.textContent = '▶️ Resume Reading';
+            }
+          });
+        }
+      })();
+    </script>
+    """
+
+    tts_json = json_for_script(plain_text_for_tts)
+
+    doc = (
+        template
+        .replace("__PANE_HEIGHT__", str(pane_height))
+        .replace("__FONT_FAMILY__", font_family)
+        .replace("__FONT_SIZE__", str(font_size))
+        .replace("__THEME_STYLE__", theme_style)
+        .replace("__HTML_CONTENT__", html_content)
+        .replace("__TTS_TEXT_JSON__", tts_json)
+    )
+    components.html(doc, height=pane_height + 70, scrolling=False)
+
+
+# ---------------------------------------------------------------------------
+# UI Entrypoint
+# ---------------------------------------------------------------------------
+
+st.title("📖 Clean 9:16 Reader")
+
+if not sb:
+    st.info("💡 Supabase not connected. Operating in session memory mode.")
+
+history_list = load_history()
+selected_history_url = None
+
+if history_list:
+    with st.expander("🕒 Recent URLs", expanded=False):
+        chosen = st.selectbox("Select a previously accessed page:", ["-- Select from history --"] + history_list, index=0)
+        if chosen != "-- Select from history --":
+            selected_history_url = chosen
+        if st.button("🗑️ Clear History"):
+            clear_history()
+            st.rerun()
+
+library_items = load_library()
+loaded_from_library = None
+
+if library_items:
+    with st.expander(f"📚 Saved Articles ({len(library_items)})", expanded=False):
+        for entry in library_items:
+            art_id = entry["id"]
+            col_title, col_open, col_txt, col_html, col_del = st.columns([4, 1.3, 1, 1, 1])
+            col_title.write(entry.get("title", entry.get("url", "Untitled")))
+            if col_open.button("Open", key=f"open_{art_id}"):
+                loaded_from_library = entry["content"]
+            col_txt.download_button(
+                "⬇️ .txt",
+                data=to_plain_text_for_export(entry["content"]),
+                file_name=f"{entry.get('title', 'article')[:60]}.txt",
+                mime="text/plain",
+                key=f"dl_txt_{art_id}",
+            )
+            col_html.download_button(
+                "⬇️ .html",
+                data=entry["content"],
+                file_name=f"{entry.get('title', 'article')[:60]}.html",
+                mime="text/html",
+                key=f"dl_html_{art_id}",
+            )
+            if col_del.button("🗑️", key=f"del_{art_id}"):
+                delete_from_library(art_id)
+                st.rerun()
+
+col_input, col_ia_check, col_clear = st.columns([3, 1, 0.8])
+with col_input:
+    url_input = st.text_input(
+        "Paste URL (Article, Recipe, OneDrive, PDF, or text):",
+        value=selected_history_url if selected_history_url else "",
+        placeholder="https://...",
+    )
+with col_ia_check:
+    st.write("")
+    st.write("")
+    use_wayback = st.checkbox("🏛️ Wayback", help="Force retrieval from Internet Archive snapshot")
+with col_clear:
+    st.write("")
+    st.write("")
+    if st.button("🔄 Cache", help="Flush cached pages and re-fetch"):
+        st.cache_data.clear()
+        st.toast("Cache flushed!", icon="🧹")
+        st.rerun()
+
+uploaded_file = st.file_uploader("Or upload document:", type=["txt", "pdf", "docx", "epub", "rtf", "md"])
+
+with st.expander("📋 Manual Text / Recipe Paste (Fallback)"):
+    manual_text = st.text_area("Paste raw text or recipe directions here:", height=150)
+
+content = ""
+active_source_url = None
+
+if loaded_from_library:
+    content = loaded_from_library
+elif manual_text.strip():
+    content = format_plain_text(manual_text)
+elif url_input:
+    with st.spinner("Extracting & formatting..."):
+        result = extract_from_url(url_input, prefer_wayback=use_wayback)
+        if result.ok:
+            content = result.content
+            active_source_url = url_input
+        else:
+            st.error(result.message)
+elif uploaded_file:
+    with st.spinner("Formatting file..."):
+        try:
+            b = uploaded_file.read()
+            ext = uploaded_file.name.split(".")[-1].lower()
+            if ext == "pdf":
+                content = extract_pdf(b)
+            elif ext == "docx":
+                content = extract_docx(b)
+            elif ext == "epub":
+                content = extract_epub(b)
+            elif ext == "rtf":
+                content = extract_rtf(b)
+            elif ext == "md":
+                content = extract_markdown(b)
+            else:
+                content = format_plain_text(decode_bytes(b))
+        except Exception as e:
+            st.error(f"Error parsing file: {e}")
+
+if content:
+    if active_source_url:
+        save_url_to_history(active_source_url)
+
+    # Check if content has recipe characteristics
+    is_recipe_url = any(dom in (active_source_url or "").lower() for dom in ("cooking.nytimes.com", "allrecipes.com", "seriouseats.com", "epicurious.com"))
+    has_recipe_terms = "ingredient" in content.lower() and any(k in content.lower() for k in ("preparation", "direction", "instruction", "method", "steps", "servings"))
+    is_recipe_doc = is_recipe_url or has_recipe_terms
+
+    # --- Scaler Controls (Visible only on recipes) ---
+    scale_multiplier = 1.0
+    if is_recipe_doc:
+        col_scale_lbl, col_scale_btn = st.columns([2, 3])
+        with col_scale_lbl:
+            st.markdown("🍳 **Scale Servings:**")
+        with col_scale_btn:
+            scale_choice = st.radio(
+                "Scale",
+                options=["0.5x (Half)", "1x (Normal)", "2x (Double)", "3x (Triple)"],
+                index=1,
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+            mult_map = {"0.5x (Half)": 0.5, "1x (Normal)": 1.0, "2x (Double)": 2.0, "3x (Triple)": 3.0}
+            scale_multiplier = mult_map[scale_choice]
+
+        if scale_multiplier != 1.0:
+            content = scale_recipe_html(content, scale_multiplier)
+
+    # Sanitize and render directly without TOC headings
+    final_rendered_html = sanitize_html(content)
+
+    raw_plain_text = BeautifulSoup(final_rendered_html, "html.parser").get_text(separator=" ")
+    word_count = len(raw_plain_text.split())
+    reading_time_min = max(1, round(word_count / 200)) if word_count > 0 else 0
+
+    st.divider()
+
+    col_meta, col_copy = st.columns([3, 2])
+    with col_meta:
+        st.markdown(
+            f"<div class='meta-chip'>⏱️ ~{reading_time_min} min read &nbsp;•&nbsp; {word_count:,} words</div>",
+            unsafe_allow_html=True,
+        )
+    with col_copy:
+        with st.popover("📋 Copy Text"):
+            st.code(raw_plain_text, language=None)
+
+    save_key = active_source_url or f"upload_{hash(content[:60])}"
+    if st.button("💾 Save to Supabase Library (read offline later)"):
+        sanitized = sanitize_html(content)
+        title = guess_title(sanitized, fallback=active_source_url or "Uploaded Document")
+        if save_to_library(save_key, title, sanitized, word_count):
+            st.success("Saved to Supabase.")
+            st.rerun()
+        else:
+            st.error("Could not save to Supabase. Verify database connections.")
+
+    with st.expander("⚙️ Reader Controls", expanded=False):
+        font_family_opt = st.selectbox("Typeface", ["Sans-Serif", "Serif", "Monospace"], key="reader_font")
+        font_size_val = st.slider("Font Size (px)", min_value=14, max_value=32, value=18, step=1, key="reader_size")
+        theme = st.selectbox("Color Theme", ["Light", "Sepia", "Dark"], key="reader_theme")
+        pane_height_val = st.slider(
+            "Reading Pane Height (px)", min_value=400, max_value=1000, value=600, step=50, key="reader_pane_height"
+        )
+        st.caption("Scroll and read-aloud controls are located in the top toolbar of the reader below.")
+
+    font_map = {
+        "Sans-Serif": "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+        "Serif": "Georgia, Cambria, 'Times New Roman', serif",
+        "Monospace": "Menlo, Consolas, Monaco, monospace",
+    }
+    theme_map = {
+        "Light": "background-color: #ffffff; color: #111111;",
+        "Sepia": "background-color: #fbf0d9; color: #433422;",
+        "Dark": "background-color: #1a1a1a; color: #e0e0e0;",
+    }
+
+    render_reader(
+        html_content=final_rendered_html,
+        plain_text_for_tts=raw_plain_text,
+        font_family=font_map[font_family_opt],
+        font_size=font_size_val,
+        theme_style=theme_map[theme],
+        pane_height=pane_height_val,
+    )
