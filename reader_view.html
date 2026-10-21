@@ -134,7 +134,8 @@
       height: {{ pane_height }}px;
       overflow-y: auto;
       -webkit-overflow-scrolling: touch;
-      scroll-behavior: smooth;
+      /* Removed scroll-behavior: smooth to prevent fighting setInterval */
+      box-sizing: border-box;
     }
     .reader-frame {
       font-family: {{ font_family }};
@@ -272,18 +273,27 @@
       let scrollActive = false;
 
       function startScrolling() {
-        if (scrollTimer) clearInterval(scrollTimer);
-        scrollTimer = setInterval(function () {
-          scrollEl.scrollBy({ top: 1, behavior: 'auto' });
-        }, scrollSpeedMs);
-      }
-
-      function stopScrolling() {
         if (scrollTimer) {
           clearInterval(scrollTimer);
           scrollTimer = null;
         }
+        scrollTimer = setInterval(function () {
+          // Check if bottom reached
+          if (scrollEl.scrollTop + scrollEl.clientHeight >= scrollEl.scrollHeight - 2) {
+            setScrollActive(false);
+            return;
+        }
+        // Increment directly without smooth animation lag
+        scrollEl.scrollTop += 1;
+      }, scrollSpeedMs);
+    }
+
+    function stopScrolling() {
+      if (scrollTimer) {
+        clearInterval(scrollTimer);
+        scrollTimer = null;
       }
+    }
 
       function setScrollActive(active) {
         scrollActive = active;
