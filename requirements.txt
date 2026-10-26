@@ -1,15 +1,16 @@
-streamlit
-curl_cffi
+# Dependencies for app.py (versions the tests ran against; newer is usually fine)
+streamlit>=1.40
+curl_cffi>=0.7
+bleach
+beautifulsoup4
+lxml
 trafilatura
+extruct
+recipe-scrapers>=15
 pypdf
 python-docx
-ebooklib
-beautifulsoup4
+EbookLib
 striprtf
-markdown
-extruct
-bleach
+Markdown
 supabase
-recipe-scrapers
-markdownify
 streamlit-cookies-controller
